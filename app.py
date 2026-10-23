@@ -2,11 +2,25 @@
 
 실행:  run.bat  또는  streamlit run app.py
 """
+import importlib
+import os
+import sys
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+
+# Streamlit Cloud는 새 코드를 받아도 이미 불러온 우리 모듈(quant_engine 등)을 그대로 쓸 때가 있다 (예전엔 'Reboot app' 필요).
+# 파일이 바뀐 모듈이 있으면 의존 순서대로 모두 다시 불러오고, 예전 코드로 계산해 둔 캐시도 비운다.
+_LOCAL_MODULES = ("quant_engine", "kr_costs", "repro", "kr_data", "market_data", "alt_data", "direction", "regime",
+                  "universe", "forecast_log", "ui")
+_loaded = [m for m in _LOCAL_MODULES if m in sys.modules]
+if any(getattr(sys.modules[m], "_loaded_mtime", None) != os.path.getmtime(sys.modules[m].__file__) for m in _loaded):
+    for _m in _loaded:
+        importlib.reload(sys.modules[_m])
+    st.cache_data.clear()
 
 import alt_data as ad
 import direction as dr
@@ -19,8 +33,11 @@ import repro
 import ui
 import universe as uv
 from quant_engine import GarchVolForecaster, max_drawdown, timing_attribution, var_backtest, var_es
-
 from quant_engine import VOL_MODELS, fit_vol_model
+
+for _m in _LOCAL_MODULES:                    # 다음 실행 때 파일이 바뀌었는지 비교할 기준
+    if _m in sys.modules:
+        sys.modules[_m]._loaded_mtime = os.path.getmtime(sys.modules[_m].__file__)
 
 st.set_page_config(page_title="한국 주식 예측기", page_icon="📈", layout="wide")
 ui.apply()
