@@ -310,13 +310,25 @@ def krx_daily_all(day, market="STK"):
 
     그날 기준 목록이라 나중에 상장폐지된 종목도 들어 있다 → 생존 편향 없는 종목 범위를 만들 수 있다.
     KRX가 접근 방식(로그인 등)을 바꾸면 실패할 수 있어, 아직은 연결 점검용으로만 쓴다."""
-    r = requests.post(KRX_JSON, timeout=20,
-                      headers={"User-Agent": "Mozilla/5.0",
-                               "Referer": "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101"},
-                      data={"bld": "dbms/MDC/STAT/standard/MDCSTAT01501", "locale": "ko_KR", "mktId": market,
-                            "trdDd": pd.Timestamp(day).strftime("%Y%m%d"), "share": "1", "money": "1", "csvxls_isNo": "false"})
-    r.raise_for_status()
-    rows = r.json().get("OutBlock_1") or []
+    data = {"bld": "dbms/MDC/STAT/standard/MDCSTAT01501", "locale": "ko_KR", "mktId": market,
+            "trdDd": pd.Timestamp(day).strftime("%Y%m%d"), "share": "1", "money": "1", "csvxls_isNo": "false"}
+    errors = []
+    for url in (KRX_JSON, KRX_JSON.replace("https://", "http://")):     # 주소·머리말 형식을 바꿔 가며 시도
+        try:
+            with requests.Session() as ses:
+                ses.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "X-Requested-With": "XMLHttpRequest",
+                                    "Referer": url.split("/comm/")[0] + "/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101"})
+                ses.get(url.split("/comm/")[0] + "/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101", timeout=20)
+                r = ses.post(url, data=data, timeout=20)
+            r.raise_for_status()
+            rows = r.json().get("OutBlock_1") or []
+            break
+        except Exception as e:
+            errors.append(f"{url.split(':')[0]}: {type(e).__name__} {str(e)[:120]} / 응답 앞부분 {getattr(r, 'text', '')[:80]!r}"
+                          if 'r' in locals() else f"{url.split(':')[0]}: {type(e).__name__} {str(e)[:120]}")
+            rows = []
+    if errors and not rows:
+        raise ConnectionError(" | ".join(errors))
     if not rows:
         raise ValueError("빈 응답 (휴장일이거나 접근이 막힘)")
     return pd.DataFrame(rows)
