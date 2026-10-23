@@ -98,22 +98,38 @@ class GarchVolForecaster:
 
     dist="t"(기본): 충격이 스튜던트 t분포 — 폭락·폭등(두꺼운 꼬리)을 반영, 자유도 nu도 추정.
     dist="normal": 가우시안 (nu = ∞).
+    asym=True: GJR-GARCH — 전날 수익률이 음수였으면 충격 반응이 α 대신 α+γ (하락한 날 변동성이 더 커지는 '레버리지 효과').
     입력: 일간 로그수익률(소수 단위). 출력: 연율화된 소수 변동성 → IV와 바로 비교 가능.
     """
 
-    def __init__(self, trading_days=252, dist="t"):
+    def __init__(self, trading_days=252, dist="t", asym=False):
         if dist not in ("t", "normal"):
             raise ValueError("dist는 't' 또는 'normal'이어야 합니다.")
-        self.trading_days, self.dist = trading_days, dist
+        self.trading_days, self.dist, self.asym = trading_days, dist, bool(asym)
         self.omega = self.alpha = self.beta = self.sigma2_next = None
+        self.gamma = 0.0         # 하락한 날의 추가 충격 반응 (GJR일 때만)
         self.nu = np.inf
         self.mu = 0.0            # 적합 구간 평균 일간 수익률 (분산 갱신 시 빼는 값)
         self.cond_vol = None     # 적합 구간의 조건부 변동성(연율) — 차트용
         self.converged = True    # 최적화가 실패해 기본값으로 대체했으면 False
         self.warnings = []       # 경계값에 닿은 추정 등 사용자에게 알릴 내용
+        self.nll = np.nan        # 음의 로그우도 (같은 데이터·분포끼리 비교용, % 단위 스케일 상수 제외)
 
     # 최적화가 실패했을 때 쓰는 보수적인 기본값 (주식 일간 수익률에서 흔한 수준, 장기 분산 = 표본 분산)
     FALLBACK = {"alpha": 0.05, "beta": 0.90, "nu": 8.0}
+
+    @property
+    def name(self):
+        return "GJR-GARCH" if self.asym else "GARCH"
+
+    @property
+    def n_params(self):
+        return 3 + self.asym + (self.dist == "t")
+
+    @property
+    def aic(self):
+        """AIC = 2·변수 수 + 2·음의 로그우도. 같은 수익률로 적합한 모델끼리 낮을수록 낫다."""
+        return 2 * self.n_params + 2 * self.nll
 
     def fit(self, daily_log_returns):
         r = np.asarray(daily_log_returns, float)
@@ -122,33 +138,41 @@ class GarchVolForecaster:
         x = (r - self.mu) * 100.0          # 수치 안정성을 위해 % 단위로 스케일
         n, var0 = len(x), x.var()
         self.converged, self.warnings = True, []
+        neg = (x[:-1] < 0).astype(float)
+        gi = 3 if self.asym else None      # 변수 순서: ω, α, β, (γ), (ν)
+        ni = 3 + self.asym if self.dist == "t" else None
 
         def cond_var(p):
-            omega, alpha, beta = p
+            omega, alpha, beta = p[:3]
+            gamma = p[gi] if gi is not None else 0.0
             s2 = np.empty(n)
             s2[0] = var0
-            s2[1:], _ = lfilter([1.0], [1.0, -beta], omega + alpha * x[:-1] ** 2, zi=[beta * var0])
+            s2[1:], _ = lfilter([1.0], [1.0, -beta], omega + (alpha + gamma * neg) * x[:-1] ** 2, zi=[beta * var0])
             return s2
 
         def nll(p):
-            s2 = cond_var(p[:3])
+            s2 = cond_var(p)
             if self.dist == "normal":
                 return 0.5 * np.sum(np.log(s2) + x**2 / s2)
-            nu = p[3]       # 분산이 s2가 되도록 표준화한 t분포
+            nu = p[ni]       # 분산이 s2가 되도록 표준화한 t분포
             const = gammaln((nu + 1) / 2) - gammaln(nu / 2) - 0.5 * np.log(np.pi * (nu - 2))
             return np.sum(0.5 * np.log(s2) + (nu + 1) / 2 * np.log1p(x**2 / ((nu - 2) * s2))) - n * const
 
-        bounds = [(1e-8, None), (1e-6, 0.999), (1e-6, 0.999)] + ([(2.1, 200.0)] if self.dist == "t" else [])
-        cons = [{'type': 'ineq', 'fun': lambda p: 0.9999 - p[1] - p[2]}]
+        bounds = ([(1e-8, None), (1e-6, 0.999), (1e-6, 0.999)] + ([(0.0, 0.999)] if self.asym else [])
+                  + ([(2.1, 200.0)] if self.dist == "t" else []))
+        half_g = (lambda p: 0.5 * p[gi]) if self.asym else (lambda p: 0.0)
+        cons = [{'type': 'ineq', 'fun': lambda p: 0.9999 - p[1] - p[2] - half_g(p)}]
         # 첫 시작값으로 성공하면 그대로 쓰고(대부분), 실패하면 다른 시작값으로 차례로 다시 시도한다
-        starts = [[0.05 * var0, 0.05, 0.90, 8.0], [0.10 * var0, 0.10, 0.80, 5.0], [0.02 * var0, 0.03, 0.95, 12.0]]
+        starts = [[0.05 * var0, 0.05, 0.90, 0.05, 8.0], [0.10 * var0, 0.10, 0.80, 0.10, 5.0], [0.02 * var0, 0.03, 0.95, 0.02, 12.0]]
+        if not self.asym:
+            starts = [st[:3] + st[4:] for st in starts]
         best = None
         if n >= 30 and var0 > 0:
             for x0 in starts:
                 with np.errstate(all="ignore"):
                     res = minimize(nll, x0=x0[:len(bounds)], method='SLSQP', bounds=bounds, constraints=cons)
                 ok = (res.success and np.all(np.isfinite(res.x)) and np.isfinite(res.fun)
-                      and res.x[1] + res.x[2] < 1.0)
+                      and res.x[1] + res.x[2] + half_g(res.x) < 1.0)
                 if ok and (best is None or res.fun < best.fun):
                     best = res
                 if best is not None:
@@ -156,34 +180,45 @@ class GarchVolForecaster:
         if best is None:                    # 추정 실패 → 기본값으로 대체하고 알린다 (조용히 틀린 값을 쓰지 않음)
             fb = self.FALLBACK
             a, b = fb["alpha"], fb["beta"]
-            params = [max(var0, 1e-8) * (1 - a - b), a, b]
-            self.nu = fb["nu"] if self.dist == "t" else np.inf
+            p = [max(var0, 1e-8) * (1 - a - b), a, b] + ([0.0] if self.asym else []) + ([fb["nu"]] if self.dist == "t" else [])
             self.converged = False
             self.warnings.append(f"GARCH 추정이 수렴하지 않아 기본값(α={a}, β={b}, 장기 분산 = 표본 분산)으로 대체했습니다.")
         else:
-            params = list(best.x[:3])
-            self.nu = float(best.x[3]) if self.dist == "t" else np.inf
-            if params[1] + params[2] > 0.995:
+            p = list(best.x)
+        self.nu = float(p[ni]) if self.dist == "t" else np.inf
+        omega, alpha, beta = p[:3]
+        self.gamma = float(p[gi]) if self.asym else 0.0
+        if best is not None:
+            if alpha + beta + 0.5 * self.gamma > 0.995:
                 self.warnings.append("α+β가 1에 매우 가깝게 추정됐습니다 — 변동성 충격이 거의 사라지지 않는다는 뜻이라 "
                                      "장기 예측이 불안정할 수 있습니다.")
             if self.dist == "t" and self.nu >= 199.0:
                 self.warnings.append("꼬리 두께 ν가 상한(200)에 닿았습니다 — 정규분포와 거의 같다는 뜻입니다.")
             if self.dist == "t" and self.nu <= 2.11:
                 self.warnings.append("꼬리 두께 ν가 하한(2.1)에 닿았습니다 — 극단값에 끌려간 추정일 수 있습니다.")
-        omega, alpha, beta = params
-        s2 = cond_var(params)
+        if n >= 2 and var0 > 0:
+            s2 = cond_var(p)
+            self.nll = float(nll(p))
+        else:
+            s2 = np.full(max(n, 1), max(var0, 1e-8))
         self.omega, self.alpha, self.beta = omega / 1e4, alpha, beta
-        self.sigma2_next = (omega + alpha * x[-1] ** 2 + beta * s2[-1]) / 1e4
+        last = x[-1] if n else 0.0
+        self.sigma2_next = (omega + (alpha + self.gamma * (last < 0)) * last ** 2 + beta * s2[-1]) / 1e4
         self.cond_vol = np.sqrt(s2 / 1e4 * self.trading_days)
         return self
 
+    def next_var(self, s2, e):
+        """오늘 분산 s2와 오늘 충격 e(평균을 뺀 일간 수익률, 소수) → 내일 분산."""
+        return self.omega + (self.alpha + self.gamma * (e < 0)) * e ** 2 + self.beta * s2
+
     @property
     def persistence(self):
-        return self.alpha + self.beta
+        """변동성 충격의 지속성. GJR은 하락이 절반 확률이라 α + γ/2 + β."""
+        return self.alpha + 0.5 * self.gamma + self.beta
 
     @property
     def long_run_var(self):
-        return self.omega / (1.0 - self.alpha - self.beta)
+        return self.omega / (1.0 - self.persistence)
 
     def daily_var_path(self, horizon_days):
         """향후 1..horizon_days 각 날의 예측 일간 분산."""
@@ -198,7 +233,7 @@ class GarchVolForecaster:
         """적합한 GARCH(+t 충격)로 앞으로 1..horizon_days일의 누적 로그수익률을 시뮬레이션 → (n_paths, horizon_days).
 
         평균은 0으로 둔다 (중앙값 ≈ 현재가). 변동성이 날마다 바뀌고 충격이 두꺼운 꼬리를 가지므로,
-        정규분포 공식(±z·σ√h)보다 폭락·폭등 쪽 분위수가 현실에 가깝다.
+        정규분포 공식(±z·σ√h)보다 폭락·폭등 쪽 분위수가 현실에 가깝다. GJR이면 하락한 날 다음 변동성이 더 커진다.
         """
         rng = np.random.default_rng(seed)
         s2 = np.full(n_paths, self.sigma2_next)
@@ -211,8 +246,20 @@ class GarchVolForecaster:
             r = np.sqrt(s2) * z
             cum += r
             out[:, k] = cum
-            s2 = self.omega + self.alpha * r**2 + self.beta * s2
+            s2 = self.next_var(s2, r)
         return out
+
+
+VOL_MODELS = {"auto": "자동 (AIC로 고름)", "garch": "GARCH (대칭)", "gjr": "GJR-GARCH (하락 때 더 커짐)"}
+
+
+def fit_vol_model(returns, model="auto", dist="t"):
+    """변동성 모델 적합. model: 'garch' | 'gjr' | 'auto'(둘 다 적합해 AIC가 낮은 쪽, GJR이 수렴하지 못하면 GARCH)."""
+    if model in ("garch", "gjr"):
+        return GarchVolForecaster(dist=dist, asym=model == "gjr").fit(returns)
+    g = GarchVolForecaster(dist=dist).fit(returns)
+    j = GarchVolForecaster(dist=dist, asym=True).fit(returns)
+    return j if j.converged and np.isfinite(j.aic) and j.aic < g.aic else g
 
 
 class VolatilityTradingLogic:
@@ -470,7 +517,7 @@ def var_exception_tests(hits, p):
             "종합 p값": float(chi2.sf(lr_pof + lr_ind, 2))}
 
 
-def var_backtest(returns, levels=(0.95, 0.99), window=750, refit_every=21, start=None, dist="t"):
+def var_backtest(returns, levels=(0.95, 0.99), window=750, refit_every=21, start=None, dist="t", model="garch"):
     """하루 VaR 워크포워드 검증: refit_every일마다 그때까지의 수익률로 GARCH를 다시 적합하고,
     그 사이에는 실제 수익률로 조건부 분산만 갱신하며 매일 다음 날 VaR를 낸다 (앱 화면의 VaR와 같은 평균 0 가정).
     겹치지 않는 하루 단위라 Kupiec·Christoffersen 검정을 그대로 쓸 수 있다.
@@ -480,13 +527,13 @@ def var_backtest(returns, levels=(0.95, 0.99), window=750, refit_every=21, start
     start = max(250, n - 500) if start is None else start
     hits = {lv: [] for lv in levels}
     for b in range(start, n, refit_every):
-        g = GarchVolForecaster(dist=dist).fit(r[max(0, b - window):b])
+        g = fit_vol_model(r[max(0, b - window):b], model, dist)
         zq = {lv: _std_quantile(1 - lv, g.nu) for lv in levels}
         s2 = g.sigma2_next
         for t in range(b, min(b + refit_every, n)):
             for lv in levels:
                 hits[lv].append(r[t] < zq[lv] * np.sqrt(s2))
-            s2 = g.omega + g.alpha * (r[t] - g.mu) ** 2 + g.beta * s2
+            s2 = g.next_var(s2, r[t] - g.mu)
     rows = {f"하루 VaR {lv:.0%}": var_exception_tests(hits[lv], 1 - lv) for lv in levels}
     return pd.DataFrame(rows).T
 

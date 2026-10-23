@@ -29,7 +29,7 @@ from sklearn.linear_model import Ridge
 import alt_data as ad
 import kr_data
 from kr_costs import sell_tax_rate
-from quant_engine import deflated_sharpe, max_drawdown, ols
+from quant_engine import deflated_sharpe, fit_vol_model, max_drawdown, ols, var_es
 
 UDIR = kr_data.CACHE / "universe"
 UA = {"User-Agent": "Mozilla/5.0"}
@@ -452,6 +452,91 @@ def selection_check(curves, h):
         return None
     k = np.sqrt(252 / h)
     return {**res, "best": best, "sr_ann": res["sr"] * k, "sr0_ann": res["sr0"] * k}
+
+
+# ---------------- 운용 규모와 위험 ----------------
+def _holdings(wf, model="auto", q=5):
+    """리밸런싱 날짜별 보유 종목 (evaluate와 같은 규칙: 점수 상위 1/q, 점수가 없으면 전체 종목)."""
+    known = wf["fwd"].notna().sum(axis=1) > 20
+    out = {}
+    for d in [d for d in wf["rebal"] if known.loc[d]]:
+        s = wf["scores"][model].loc[d].dropna()
+        out[d] = (list(wf["universe"].columns[wf["universe"].loc[d]]) if len(s) < 20 else list(s.nlargest(len(s) // q).index))
+    return out
+
+
+def capacity(wf, panel, curves, model="auto", capitals=(1e7, 1e8, 1e9, 1e10, 1e11), impact=1.0, q=5):
+    """운용 규모(원)별 시장 충격 비용 — 주문이 그 종목 하루 거래대금에서 차지하는 비율이 클수록 불리하게 체결된다.
+
+    제곱근 법칙: 한 번 사거나 팔 때 추가 비용 ≈ impact × 하루 변동성 × √(주문 금액 / 하루 거래대금).
+    리밸런싱마다 새로 사거나 판 종목만 비용을 낸다 (종목당 금액 = 자본 / 보유 종목 수, 거래대금은 그날 기준 63일 평균).
+    반환: 자본별 평균 주문 비율, 추가 비용(연), 비용 반영 초과수익(연)과 t값 — 수수료·세금은 curves에 이미 반영된 것에 더한다.
+    """
+    hold = _holdings(wf, model, q)
+    dates = list(hold)
+    adv = np.exp(panel["feat"]["liq"])
+    vol = np.log(panel["close"]).diff().rolling(63, min_periods=40).std()
+    cv = curves[model]["상위 20% (비용 후)"].reindex(dates)
+    uni = curves["_universe"].reindex(dates)
+    ex = (cv / cv.shift(1).fillna(1.0) - 1) - (uni / uni.shift(1).fillna(1.0) - 1)
+    per_year = 252 / wf["h"]
+    rows = {}
+    for cap in capitals:
+        cost, part, prev = [], [], None
+        for d in dates:
+            now = set(hold[d])
+            buys, sells = now - (prev or set()), (prev or set()) - now
+            c = 0.0
+            for names, n in ((buys, len(now)), (sells, len(prev) if prev else 1)):
+                for code in names:
+                    a, v = adv.at[d, code], vol.at[d, code]
+                    if not (np.isfinite(a) and np.isfinite(v) and a > 0):
+                        continue
+                    share = cap / n / a                          # 주문 금액 / 하루 거래대금
+                    c += impact * v * np.sqrt(share) / n         # 포트폴리오 대비 비용
+                    part.append(share)
+            cost.append(c)
+            prev = now
+        net = ex - pd.Series(cost, index=dates)
+        rows[f"{cap / 1e8:,.0f}억 원" if cap >= 1e8 else f"{cap / 1e4:,.0f}만 원"] = {"주문 / 하루 거래대금 (중앙값)": float(np.median(part)) if part else np.nan,
+                                "시장 충격 비용(연)": float(np.mean(cost) * per_year),
+                                "초과수익(연, 모든 비용 후)": float(net.mean() * per_year),
+                                "t값": float(net.mean() / net.std() * np.sqrt(len(net))) if net.std() > 0 else np.nan}
+    return pd.DataFrame(rows).T
+
+
+def current_basket(wf, q=5):
+    """지금(마지막 리밸런싱) 추천 상위 1/q 종목 — 앱에 보이는 순위와 같은 점수(자동 선택, 없으면 고정 가중)."""
+    d = wf["rebal"][-1]
+    s = wf["scores"]["auto"].loc[d].dropna()
+    if wf["chosen"].loc[d] == "none" or s.empty:
+        s = wf["scores"]["composite"].loc[d].dropna()
+    return list(s.nlargest(max(len(s) // q, 1)).index)
+
+
+def basket_risk(panel, codes, lookback=756, n_stress=5):
+    """지금 고른 종목들(동일 비중, 매일 비중 유지)을 지난 lookback일 동안 그대로 들고 있었다면 — 위험 지표와 시장 급락일 손실.
+
+    반환: dict(var95·es95·var99 (하루, 과거 실제), garch_var95 (지금 변동성 기준 내일), worst_day, worst_month, beta,
+              stress = 전체 종목 평균이 가장 많이 빠진 날들의 시장·포트폴리오 수익률)."""
+    r = np.exp(np.log(panel["close"]).diff().iloc[-lookback:]) - 1
+    uni = panel["universe"].reindex(r.index).fillna(False)
+    port = r[codes].mean(axis=1).dropna()
+    mkt = r.where(uni).mean(axis=1).reindex(port.index)
+    lp = np.log1p(port)
+    v95, e95 = var_es(lp.values, 0.95)
+    v99, _ = var_es(lp.values, 0.99)
+    g = fit_vol_model(lp.values)
+    sims = g.simulate(1, 20000, seed=0)[:, 0]
+    m21 = np.expm1(lp.rolling(21).sum())
+    b = ols(port, mkt.rename("시장").to_frame())
+    worst = mkt.nsmallest(n_stress).index
+    stress = pd.DataFrame({"전체 종목 평균": mkt[worst], "지금 고른 종목": port[worst]}).sort_index()
+    stress.index = stress.index.strftime("%Y-%m-%d")
+    stress.index.name = "날짜"
+    return {"var95": v95, "es95": e95, "var99": v99, "garch_var95": var_es(sims, 0.95)[0], "model": g.name,
+            "worst_day": (port.idxmin(), float(port.min())), "worst_month": (m21.idxmin(), float(m21.min())),
+            "beta": float(b["coef"]["시장"]), "n": len(codes), "days": len(port), "stress": stress}
 
 
 def current_picks(panel, wf, k=20):

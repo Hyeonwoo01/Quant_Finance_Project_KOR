@@ -23,7 +23,8 @@ import alt_data as ad
 import direction as dr
 import market_data as md
 import regime as rg
-from quant_engine import GarchVolForecaster, ols, overlap_tstat, var_es, var_exception_tests
+import repro
+from quant_engine import fit_vol_model, ols, overlap_tstat, var_es, var_exception_tests
 
 LOG_DIR = Path(__file__).parent / "forecast_log"
 LOG_PATH = LOG_DIR / "log.csv"
@@ -34,8 +35,8 @@ GARCH_YEARS = 3           # 앱 기본 '학습 데이터' 설정과 같게
 SENTIMENT = {"pc_volume": "풋/콜 거래량 비율", "pc_oi": "풋/콜 미결제약정 비율", "skew": "옵션 스큐 (풋 90% − 콜 110% IV)",
              "eps_rev_30d": "올해 EPS 전망 30일 변화", "news_7d": "뉴스 감성 (최근 7일 평균)"}
 COLUMNS = ["asof", "ticker", "close", "h", "p_up", "p_base", "model", "vol_garch", "lo95", "lo68", "hi68", "hi95",
-           "var95_1d", "var99_1d", "garch_ok", "iv_atm", "iv_days", "vol_index", "p_high",
-           *SENTIMENT, "news_n", "version", "logged_at"]
+           "var95_1d", "var99_1d", "garch_ok", "vol_model", "iv_atm", "iv_days", "vol_index", "p_high",
+           *SENTIMENT, "news_n", "data_fp", "version", "logged_at"]
 
 
 # 거래소별 (시간대, 장 마감 시각 + 여유 분). 그 전에 돌리면 오늘 봉은 아직 움직이는 중이라 쓰지 않는다.
@@ -70,7 +71,7 @@ def predict(ticker, h=H, have=frozenset()):
     """앱 기본 설정과 같은 계산으로 오늘(마지막 종가 기준)의 예측 한 줄. 그 날짜가 이미 기록돼 있으면(휴장일 등) skip 표시만."""
     close = drop_unfinished(md.load_history(ticker, 10), ticker)
     asof, spot = close.index[-1], float(close.iloc[-1])
-    row = {"asof": asof.date().isoformat(), "ticker": ticker, "close": spot, "h": h}
+    row = {"asof": asof.date().isoformat(), "ticker": ticker, "close": spot, "h": h, "data_fp": repro.fingerprint(close)}
     if (row["asof"], ticker) in have:
         return {**row, "skip": True}
 
@@ -81,13 +82,14 @@ def predict(ticker, h=H, have=frozenset()):
     p_up, pick, now_all, _, _ = dr.predict_now(close, h, wf, macro, alt=alt, ticker=ticker)
     row.update(p_up=p_up, p_base=now_all.get("base", np.nan), model=pick)
 
-    # 변동성·가격 범위·하루 VaR: 앱 '주가 예측 범위' 탭과 같은 t분포 GARCH 시뮬레이션 (학습 3년)
+    # 변동성·가격 범위·하루 VaR: 앱 '주가 예측 범위' 탭과 같은 t분포 GARCH 시뮬레이션 (학습 3년, 대칭/GJR 중 AIC로)
     c3 = close[close.index > asof - pd.DateOffset(years=GARCH_YEARS)]
-    g = GarchVolForecaster().fit(np.log(c3).diff().dropna().values)
+    g = fit_vol_model(np.log(c3).diff().dropna().values, "auto")        # 앱 기본 '자동 (AIC)'과 같게
     sims = g.simulate(h)
     q = spot * np.exp(np.quantile(sims[:, -1], [0.025, 0.16, 0.84, 0.975]))
     row.update(vol_garch=g.forecast_vol(h), lo95=q[0], lo68=q[1], hi68=q[2], hi95=q[3],
-               var95_1d=var_es(sims[:, 0], 0.95)[0], var99_1d=var_es(sims[:, 0], 0.99)[0], garch_ok=bool(g.converged))
+               var95_1d=var_es(sims[:, 0], 0.95)[0], var99_1d=var_es(sims[:, 0], 0.99)[0], garch_ok=bool(g.converged),
+               vol_model=g.name)
 
     # 시장 기대 변동성: 지금 옵션의 ATM IV(약 1개월 만기)와, 있으면 변동성 지수(SPY → VIX 등)
     try:

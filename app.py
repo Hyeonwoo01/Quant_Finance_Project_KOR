@@ -15,9 +15,12 @@ import kr_costs as kc
 import kr_data
 import market_data as md
 import regime as rg
+import repro
 import ui
 import universe as uv
 from quant_engine import GarchVolForecaster, max_drawdown, timing_attribution, var_backtest, var_es
+
+from quant_engine import VOL_MODELS, fit_vol_model
 
 st.set_page_config(page_title="한국 주식 예측기", page_icon="📈", layout="wide")
 ui.apply()
@@ -196,7 +199,16 @@ def get_universe(h, cost_bps, data_stamp, lag, use_tax):
     n_univ = int(panel["universe"].iloc[-1].sum())
     return {"table": table, "curves": curves, "ic": wf["ic"]["auto"], "chosen": wf["chosen"], "date": d,
             "pick": pick, "top": top, "bottom": bottom, "coverage": panel["coverage"], "cols": wf["cols"],
-            "n_univ": n_univ, "factors": uv.factor_exposure(wf, curves), "selection": uv.selection_check(curves, h)}
+            "n_univ": n_univ, "factors": uv.factor_exposure(wf, curves), "selection": uv.selection_check(curves, h),
+            "capacity": _optional(uv.capacity, wf, panel, curves), "risk": _optional(lambda: uv.basket_risk(panel, uv.current_basket(wf)))}
+
+
+def _optional(fn, *args):
+    """부가 분석은 실패해도 탭 전체를 막지 않는다 (데이터 열이 빠진 경우 등) → None."""
+    try:
+        return fn(*args)
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -207,29 +219,33 @@ def get_regime(ticker, cost_bps, lag, use_tax, kind):
 
 
 @st.cache_data(show_spinner=False)
-def run_var_backtest(returns):
-    """하루 VaR 95%·99%의 워크포워드 예외 검정 (Kupiec·Christoffersen)."""
-    return var_backtest(np.asarray(returns))
+def run_var_backtest(returns, model):
+    """하루 VaR 95%·99%의 워크포워드 예외 검정 (Kupiec·Christoffersen). model: 사이드바 변동성 모델."""
+    return var_backtest(np.asarray(returns), model=model)
 
 
 @st.cache_data(show_spinner=False)
-def run_backtest(returns, h, step=10):
+def run_backtest(returns, h, model="garch", step=10):
     """과거 여러 시점에서 '그때까지 데이터만으로' 예측 → 이후 실제와 비교 (look-ahead 없음).
 
-    범위·VaR는 앱 화면과 같은 방식(t분포 GARCH 시뮬레이션의 분위수)으로 판정한다.
+    범위·VaR는 앱 화면과 같은 방식(사이드바 변동성 모델의 t분포 시뮬레이션 분위수)으로 판정한다.
+    비교용으로 대칭 GARCH(sym)와 GJR-GARCH(gjr)의 예측도 같은 시점마다 함께 남긴다.
     """
     r = np.asarray(returns)
     start = max(250, len(r) - 500)
     rows = []
     for o in range(start, len(r) - h + 1, step):
-        g = GarchVolForecaster().fit(r[max(0, o - 750):o])
+        win = r[max(0, o - 750):o]
+        gs, gj = GarchVolForecaster().fit(win), GarchVolForecaster(asym=True).fit(win)
+        g = {"garch": gs, "gjr": gj}.get(model) or (gj if gj.converged and gj.aic < gs.aic else gs)    # 자동 = AIC
         f = g.forecast_vol(h)
         real = np.sqrt(np.mean(r[o:o + h] ** 2) * 252)
         naive = np.sqrt(np.mean(r[o - max(h, 21):o] ** 2) * 252)
         q05, q025, q16, q84, q975 = np.quantile(g.simulate(h, 2000, seed=o)[:, -1], [0.05, 0.025, 0.16, 0.84, 0.975])
         move = r[o:o + h].sum()
-        rows.append((o, f, naive, real, q16 <= move <= q84, q025 <= move <= q975, move < q05))
-    return pd.DataFrame(rows, columns=["origin", "garch", "naive", "realized", "in1", "in2", "var_breach"])
+        rows.append((o, f, naive, real, q16 <= move <= q84, q025 <= move <= q975, move < q05,
+                     gs.forecast_vol(h), gj.forecast_vol(h)))
+    return pd.DataFrame(rows, columns=["origin", "garch", "naive", "realized", "in1", "in2", "var_breach", "sym", "gjr"])
 
 
 # ---------------- 사이드바 ----------------
@@ -251,6 +267,9 @@ with st.sidebar:
         ticker = st.selectbox(f"검색 결과 {len(matches)}개", matches, format_func=lambda m: m[1])[0]
     horizon = st.slider("예측 기간 (거래일)", 5, 252, 63, help="주가 범위·변동성을 예측할 기간. 21일 ≈ 1개월, 63일 ≈ 3개월")
     years = st.slider("학습 데이터 (년)", 2, 10, 3, help="변동성 모델이 참고할 과거 기간")
+    vol_model = st.selectbox("변동성 모델", list(VOL_MODELS), format_func=VOL_MODELS.get,
+                             help="GJR-GARCH는 하락한 날 다음 변동성이 더 커지는 효과(주식에서 흔함)를 반영합니다. "
+                                  "자동은 두 모델 중 AIC(데이터에 맞는 정도에서 변수 수만큼 벌점)가 낮은 쪽을 고릅니다.")
     dir_h = st.select_slider("방향 예측 기간 (거래일)", [5, 10, 21, 42, 63], 21, help="이 기간 뒤 주가가 지금보다 높을지 예측")
     st.subheader("백테스트 매매 비용")
     cost_bps = st.number_input("수수료·체결 비용 (bp, 살 때·팔 때 각각)", 0.0, 50.0, 3.0, 0.5,
@@ -276,7 +295,7 @@ except Exception as e:
     st.stop()
 
 rets = np.log(close).diff().dropna()
-garch = GarchVolForecaster().fit(rets.values)
+garch = fit_vol_model(rets.values, vol_model)
 rv_h = garch.forecast_vol(horizon)
 
 sims = garch.simulate(horizon)                                      # (경로, 일) 누적 로그수익률 — 요약 카드와 1번 탭에서 같이 씀
@@ -295,7 +314,7 @@ def show_hero(dir_metric):
         ui.hero("KOSPI · KOSDAQ", name, price_fmt(spot), close.pct_change().iloc[-1],
                 [("기준일", close.index[-1].date()), ("학습 데이터", f"{years}년"), ("구분", kc.KIND_LABELS[kind])],
                 [(f"예측 변동성 · {horizon}일", f"{rv_h:.1%}",
-                  f"1년 기준 환산 · 평소 수준 {np.sqrt(garch.long_run_var * 252):.1%}", False),
+                  f"{garch.name} · 1년 기준 · 평소 수준 {np.sqrt(garch.long_run_var * 252):.1%}", False),
                  (f"{horizon}거래일 68% 범위", f"{price_fmt(lo68)} ~ {price_fmt(hi68)}", "이 안에 머물 확률 약 68%", False),
                  ("하루 손실 위험 (VaR 95%)", f"−{v95:.1%}", f"1천만 원어치면 약 {v95 * 1e7:,.0f}원", False),
                  dir_metric],
@@ -326,7 +345,7 @@ with tab1:
     ui.section("Price Range Forecast", f"앞으로 {horizon}거래일, 주가가 움직일 범위",
                "최근 변동성을 바탕으로 주가가 얼마나 크게 움직일 수 있는지 보여줍니다. "
                "진한 띠 안에 머물 확률은 약 68%, 연한 띠는 약 95%입니다. 폭락·폭등이 정규분포보다 자주 나오는 점을 "
-               "t분포 GARCH로 반영해 1만 번 시뮬레이션했습니다. 오를지 내릴지는 <b>방향 예측</b> 탭에서 봅니다.")
+               f"t분포 {garch.name}로 반영해 1만 번 시뮬레이션했습니다. 오를지 내릴지는 <b>방향 예측</b> 탭에서 봅니다.")
     if not garch.converged:
         st.warning(garch.warnings[0] + " 범위와 VaR는 이 기본값으로 계산했으니 참고만 하세요.")
     cum_sd = np.sqrt(np.cumsum(garch.daily_var_path(horizon)))     # k일 누적 로그수익률 표준편차
@@ -375,7 +394,7 @@ with tab1:
               help="최악 5% 경우의 평균 손실")
     st.caption(f"VaR 95%는 '100번 중 95번은 손실이 이보다 작다'는 뜻입니다. 예를 들어 1,000만 원어치를 들고 있다면 "
                f"하루에 약 {risk['1d95'][0] * 1e7:,.0f}원 넘게 잃을 확률이 5%입니다. ES는 그 나머지 최악 5% 경우의 평균 손실입니다. "
-               f"큰 값은 t분포 GARCH(꼬리 두께 ν = {garch.nu:.1f}) 시뮬레이션, '과거 실제'는 학습 기간({years}년)의 실제 수익률로 계산했습니다.")
+               f"큰 값은 t분포 {garch.name}(꼬리 두께 ν = {garch.nu:.1f}) 시뮬레이션, '과거 실제'는 학습 기간({years}년)의 실제 수익률로 계산했습니다.")
 
 # ---------------- 방향 예측 ----------------
 with tab_dir:
@@ -657,6 +676,27 @@ with tab_pick:
                            "거래대금으로 근사했습니다. 노출이 크고 t가 2를 넘는 요인이 있으면 초과수익의 일부가 그 요인 덕분입니다. "
                            "알파가 0 근처면 '새로운 신호'가 아니라 이미 알려진 효과에 기울어진 결과입니다. 표본이 리밸런싱 횟수라 작으니 t값을 꼭 함께 보세요.")
 
+            capt = U.get("capacity")
+            if capt is not None:
+                st.markdown("**운용 규모를 키우면?** — 주문이 그 종목 하루 거래대금에서 차지하는 비율만큼 불리하게 체결된다고 보고 (시장 충격)")
+                st.dataframe(capt.style.format({"주문 / 하루 거래대금 (중앙값)": "{:.3%}", "시장 충격 비용(연)": "{:.2%}",
+                                                "초과수익(연, 모든 비용 후)": "{:+.1%}", "t값": _signed(1)}, na_rep="—"), width="stretch")
+                st.caption("한 번 사거나 팔 때 추가 비용 ≈ 하루 변동성 × √(주문 금액 ÷ 하루 거래대금)으로 계산했습니다 (시장 충격의 '제곱근 법칙', "
+                           "계수 1로 보수적으로). 종목당 주문 금액 = 자본 ÷ 보유 종목 수, 거래대금은 그날 기준 63일 평균입니다. "
+                           "초과수익이 0 아래로 떨어지기 시작하는 규모가 이 전략을 실제로 굴릴 수 있는 대략적인 한계입니다.")
+            rk = U.get("risk")
+            if rk is not None:
+                st.markdown(f"**지금 고른 {rk['n']}종목을 같은 비중으로 들고 있으면?** — 지난 {rk['days']}거래일 동안 그대로 들고 있었다고 보고 계산")
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("하루 VaR 95%", f"−{rk['var95']:.1%}", f"내일 기준({rk['model']}) −{rk['garch_var95']:.1%}", delta_color="off")
+                r2.metric("하루 ES 95%", f"−{rk['es95']:.1%}", "최악 5% 날의 평균 손실", delta_color="off")
+                r3.metric("최악의 하루", f"{rk['worst_day'][1]:+.1%}", f"{rk['worst_day'][0].date()}", delta_color="off")
+                r4.metric("최악의 한 달 (21거래일)", f"{rk['worst_month'][1]:+.1%}", f"{rk['worst_month'][0].date()}까지", delta_color="off")
+                st.markdown(f"시장이 가장 크게 빠졌던 날 {len(rk['stress'])}일 — 시장 = 전체 종목 평균, 이 종목들의 시장 베타 {rk['beta']:.2f}")
+                signed_table(rk["stress"] * 100, 1)
+                st.caption("단위 %. 과거 실제 수익률로 계산해서, 그 기간에 없던 종류의 충격은 반영하지 못합니다. "
+                           "베타가 1보다 크면 시장보다 더 크게 출렁인다는 뜻입니다.")
+
             left, right = st.columns(2)
             fmt = {c: "{:.0%}" for c in U["top"].columns if c not in ("순위", "종목명", "점수")}
             fmt["점수"] = "{:+.3f}"
@@ -795,12 +835,27 @@ with tab2:
     a, b, c, d, e = st.columns(5)
     a.metric("α (충격 반응)", f"{garch.alpha:.3f}", help="큰 하루 변동이 다음 날 변동성을 얼마나 키우는지")
     b.metric("β (지속성)", f"{garch.beta:.3f}", help="높아진 변동성이 얼마나 오래 유지되는지")
-    c.metric("α+β", f"{garch.persistence:.3f}", help="1에 가까울수록 변동성 충격이 오래 지속")
+    c.metric("지속성 (α+γ/2+β)" if garch.asym else "α+β", f"{garch.persistence:.3f}", help="1에 가까울수록 변동성 충격이 오래 지속")
     d.metric("반감기", f"{np.log(0.5) / np.log(garch.persistence):.0f}일" if garch.persistence < 1 else "∞")
     e.metric("꼬리 두께 (ν)", f"{garch.nu:.1f}",
              help="충격 분포(t분포)의 자유도. 작을수록 폭락·폭등이 자주 나옵니다. 정규분포는 ∞, 주식은 보통 4~10")
     for msg in garch.warnings:
         (st.warning if not garch.converged else st.caption)(msg)
+
+    st.markdown("**대칭 GARCH vs GJR-GARCH** — 같은 학습 데이터로 둘 다 적합해 비교")
+    gs_, gj_ = GarchVolForecaster().fit(rets.values), GarchVolForecaster(asym=True).fit(rets.values)
+    vcmp = pd.DataFrame({m.name: {"α (충격 반응)": m.alpha, "γ (하락한 날 추가 반응)": m.gamma, "β (지속성)": m.beta,
+                                  "지속성 (α+γ/2+β)": m.persistence, "꼬리 두께 (ν)": m.nu,
+                                  f"{horizon}일 예측 변동성": m.forecast_vol(horizon), "AIC (낮을수록 잘 맞음)": m.aic}
+                         for m in (gs_, gj_)}).T
+    vcmp.insert(0, "지금 쓰는 모델", ["✔" if n == garch.name else "" for n in vcmp.index])
+    st.dataframe(vcmp.style.format({"α (충격 반응)": "{:.3f}", "γ (하락한 날 추가 반응)": "{:.3f}", "β (지속성)": "{:.3f}",
+                                    "지속성 (α+γ/2+β)": "{:.3f}", "꼬리 두께 (ν)": "{:.1f}", f"{horizon}일 예측 변동성": "{:.1%}",
+                                    "AIC (낮을수록 잘 맞음)": "{:,.1f}"}), width="stretch",
+                 column_config={"지금 쓰는 모델": st.column_config.TextColumn("지금 쓰는 모델", alignment="center")})
+    st.caption(f"γ가 0보다 크면 하락한 날 다음 날의 변동성이 상승한 날보다 더 커진다는 뜻입니다 (이 종목 γ = {gj_.gamma:.3f}). "
+               f"AIC 차이(GARCH − GJR) {gs_.aic - gj_.aic:+.1f}: 양수면 GJR이 데이터에 더 잘 맞고, 보통 2 이상이면 의미 있는 차이로 봅니다. "
+               "실제로 앞날을 더 잘 맞히는지는 '예측 정확도 검증' 탭의 과거 검증에서 두 모델의 오차를 비교하세요.")
 
 # ---------------- 시장 국면 ----------------
 with tab_regime:
@@ -915,7 +970,7 @@ with tab4:
     st.subheader("과거 검증")
     if st.button("검증 실행", type="primary"):
         with st.spinner("과거 여러 시점에서 다시 예측하는 중…"):
-            bt = run_backtest(rets.values, horizon)
+            bt = run_backtest(rets.values, horizon, vol_model)
         if bt.empty:
             st.warning("데이터가 부족합니다. 학습 데이터 기간을 늘리거나 예측 기간을 줄이세요.")
         else:
@@ -935,10 +990,12 @@ with tab4:
             fig.update_layout(height=380, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10),
                               hovermode="x unified", legend=dict(orientation="h", y=1.1))
             ui.chart(fig)
-            st.caption(f"10거래일 간격으로 {len(bt)}번 검증했습니다. 검증 기간이 서로 겹쳐 있어 결과를 너무 믿지는 마세요.")
+            st.caption(f"10거래일 간격으로 {len(bt)}번 검증했습니다. 검증 기간이 서로 겹쳐 있어 결과를 너무 믿지는 마세요. "
+                       f"같은 시점들에서 대칭 GARCH 오차 {rmse('sym'):.2%}, GJR-GARCH 오차 {rmse('gjr'):.2%} "
+                       f"({'GJR' if rmse('gjr') < rmse('sym') else '대칭 GARCH'}가 더 정확, 모델 예측 = {VOL_MODELS[vol_model]}).")
 
             st.markdown("**하루 VaR 예외 검정** — 매일 다음 날의 VaR를 내고(21거래일마다 다시 적합), 실제 손실이 그보다 컸던 날을 셉니다")
-            vt = run_var_backtest(rets.values)
+            vt = run_var_backtest(rets.values, vol_model)
             vshow = vt.assign(판정=np.where(vt["종합 p값"].astype(float) > 0.05, "통과", "기각"))
             st.dataframe(vshow.style.format({"관측일": "{:.0f}", "예외 횟수": "{:.0f}", "예외 비율": "{:.1%}", "목표 비율": "{:.0%}",
                                              "Kupiec p값": "{:.2f}", "Christoffersen p값": "{:.2f}", "종합 p값": "{:.2f}"}),
@@ -947,6 +1004,9 @@ with tab4:
                        "(몰리면 변동성 변화를 늦게 따라간다는 뜻). p값이 0.05보다 작으면 그 VaR를 기각합니다. "
                        "하루 단위라 위의 기간 VaR와 달리 표본이 겹치지 않습니다.")
 
+st.caption(f"재현 정보 — 코드 {repro.code_version()} · 주가 데이터 {repro.fingerprint(close)}"
+           + (f" · 방향 예측 데이터 {repro.fingerprint(close_long)}" if p_up is not None else "")
+           + ". 같은 지문이면 같은 데이터로 계산한 결과입니다 (무료 데이터는 과거 값이 나중에 고쳐지기도 합니다).")
 ui.footer("교육·연구용 고지:", "이 프로그램의 예측과 신호는 과거 데이터로 계산한 참고 자료이며 투자 조언이 아닙니다. "
           "과거 검증 결과가 미래 성과를 보장하지 않습니다.",
           "주가는 Yahoo Finance, 종목 목록·수급·뉴스는 네이버 증권(비공식), 공시·재무는 DART, 금리는 한국은행 ECOS에서 받습니다. "

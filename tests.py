@@ -464,6 +464,28 @@ _rr = np.log(_c).diff().dropna()
 assert not np.allclose(rg.evaluate(pa, _rr, lag=0)["equity"].values, rg.evaluate(pa, _rr, lag=1)["equity"].values)
 out = rg.analyze(_c, 1.0)
 assert out["table"].loc["불안 국면엔 현금", "최대 낙폭"] > out["table"].loc["단순 보유", "최대 낙폭"]   # 심어 둔 국면이면 낙폭이 줄어야
+# ---------------- 비대칭 GARCH (GJR) ----------------
+from quant_engine import fit_vol_model
+def _sim_gjr(n, om, a, g, b, nu, rng):
+    r = np.empty(n); s2 = om / (1 - a - g / 2 - b)
+    for i in range(n):
+        r[i] = np.sqrt(s2) * rng.standard_t(nu) * np.sqrt((nu - 2) / nu)
+        s2 = om + (a + g * (r[i] < 0)) * r[i] ** 2 + b * s2
+    return r
+_rg = _sim_gjr(4000, 2e-6, 0.03, 0.12, 0.88, 6, np.random.default_rng(0))
+_j = GarchVolForecaster(asym=True).fit(_rg)
+assert abs(_j.gamma - 0.12) < 0.04 and abs(_j.beta - 0.88) < 0.03 and abs(_j.persistence - 0.97) < 0.02, (_j.alpha, _j.gamma, _j.beta)
+assert fit_vol_model(_rg).name == "GJR-GARCH" and fit_vol_model(_rg, "garch").name == "GARCH"      # AIC로 비대칭을 골라냄
+_sym = simulate_garch_t(4000, 2e-6, 0.08, 0.90, 6.0, np.random.default_rng(100))
+assert GarchVolForecaster(asym=True).fit(_sym).gamma < 0.02 and fit_vol_model(_sym).name == "GARCH"  # 대칭 데이터엔 γ ≈ 0
+# 다음 날 분산 = 마지막 날 충격 부호까지 반영, 시뮬레이션도 하락 뒤에 변동성이 더 큼
+_e = (_rg[-1] - _j.mu)
+_s2_last = (_j.cond_vol[-1] ** 2) / 252
+assert np.isclose(_j.sigma2_next, _j.next_var(_s2_last, _e), rtol=1e-9)
+_sim = np.diff(np.c_[np.zeros(20000), _j.simulate(2, 20000, seed=3)], axis=1)
+assert (_sim[:, 1][_sim[:, 0] < 0] ** 2).mean() > 1.1 * (_sim[:, 1][_sim[:, 0] > 0] ** 2).mean()
+assert len(var_backtest(_rg[-1500:], model="auto")) == 2
+
 # ---------------- 알려진 요인·과적합 보정 ----------------
 from quant_engine import deflated_sharpe, market_exposure, ols, timing_attribution
 import market_data as md
@@ -522,6 +544,30 @@ _vb = pd.DataFrame({"underlying": _u, "long": 4 * _u ** 2 - 0.008, "cost": 0.0, 
 _me = market_exposure(_vb)
 assert _me.loc["항상 변동성 매도", "하락 상위 10% 달 평균 손익"] < _me.loc["항상 변동성 매도", "나머지 달 평균 손익"]
 assert so["dsr"] is None or (0 <= so["dsr"]["dsr"] <= 1 and so["dsr"]["n_trials"] <= len(so["candidates"]))
+# ---------------- 재현 정보 ----------------
+import repro
+_s1 = pd.Series([1.0, 2.0, 3.0], index=pd.bdate_range("2024-01-01", periods=3))
+assert repro.fingerprint(_s1) == repro.fingerprint(_s1.copy()) and "3일" in repro.fingerprint(_s1)
+assert repro.fingerprint(_s1) != repro.fingerprint(_s1 * 1.001)            # 과거 값이 고쳐지면 지문이 바뀜
+assert isinstance(repro.code_version(), str) and repro.fingerprint(_s1.iloc[:0]) == "데이터 없음"
+
+# ---------------- 종목 고르기: 운용 규모·지금 종목의 위험 ----------------
+_pc = synth_panel(5)
+_pc["feat"]["liq"] = pd.DataFrame(np.log(1e11), index=_pc["close"].index, columns=_pc["close"].columns)   # 하루 거래대금 1,000억 원
+_tq, _cq = uv.evaluate(wf_u, cost_bps=0)
+_hold = uv._holdings(wf_u, "auto")
+_gross = pd.Series({d: (np.exp(wf_u["fwd"].loc[d, c]) - 1).mean() for d, c in _hold.items()})
+_curve = _cq["auto"]["상위 20% (비용 후)"]
+assert np.allclose((_curve / _curve.shift(1).fillna(1.0) - 1).values, _gross.values)      # evaluate와 같은 보유 종목
+_cap = uv.capacity(wf_u, _pc, _cq, capitals=(1e7, 1e9, 1e11, 1e13))
+assert _cap["시장 충격 비용(연)"].is_monotonic_increasing and _cap["초과수익(연, 모든 비용 후)"].is_monotonic_decreasing
+assert _cap["시장 충격 비용(연)"].iloc[0] < 0.001 and _cap["시장 충격 비용(연)"].iloc[-1] > 0.05     # 작으면 거의 0, 크면 급격히
+_bk = uv.current_basket(wf_u)
+_rk = uv.basket_risk(_pc, _bk)
+assert len(_bk) == len(wf_u["scores"]["auto"].iloc[-1].dropna()) // 5 or len(_bk) == len(wf_u["scores"]["composite"].iloc[-1].dropna()) // 5
+assert 0 < _rk["var95"] < _rk["var99"] and _rk["worst_day"][1] <= -_rk["var95"] and len(_rk["stress"]) == 5
+assert 0.5 < _rk["beta"] < 1.5                                     # 종목 평균 비슷한 바구니 → 시장 베타 1 근처
+
 # ---------------- 앞으로의 예측 기록 ----------------
 import tempfile
 import alt_data as ad
