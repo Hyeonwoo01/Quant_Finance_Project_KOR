@@ -1,0 +1,49 @@
+name: forecast-log
+
+# 매일 장 마감 후 그날의 예측을 forecast_log/log.csv에 추가해 커밋한다 (앞으로의 예측 기록 = 실전 검증).
+# 예약 실행은 기본 브랜치(main)에서만 돈다. 코드가 바뀐 푸시에서는 저장 없이 데이터 연결만 점검한다.
+on:
+  schedule:
+    # UTC 08:07 = 한국 오후 5:07 (장 마감 15:30 뒤 1시간 반, 종가 확정 뒤)
+    - cron: "7 8 * * 1-5"
+  workflow_dispatch:
+  push:
+    paths:
+      - forecast_log.py
+      - market_data.py
+      - kr_data.py
+      - .github/workflows/forecast-log.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: forecast-log
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 예측 기록 (푸시일 때는 점검만)
+        env:
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
+        run: python forecast_log.py ${{ github.event_name == 'push' && 'check' || 'record' }}
+      - name: 기록 커밋
+        if: github.event_name != 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A forecast_log
+          if git diff --cached --quiet; then echo "새 기록 없음"; exit 0; fi
+          git commit -m "예측 기록 $(date -u +%Y-%m-%d)"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

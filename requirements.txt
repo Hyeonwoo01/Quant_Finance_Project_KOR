@@ -1,0 +1,9 @@
+# 테스트를 통과한 버전으로 고정 (Python 3.12 이상, 3.13에서 확인). 올릴 때는 python tests.py 통과 후 함께 바꾼다.
+numpy==2.5.4
+scipy==1.18.1
+pandas==3.0.6
+yfinance==1.7.0
+streamlit==1.66.0
+plotly==7.1.0
+scikit-learn==1.9.1
+requests==2.34.2

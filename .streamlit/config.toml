@@ -1,0 +1,24 @@
+# 디자인 토큰은 ui.py와 같은 값 (Apple 기반: Parchment 바탕 + 흰 카드 + Action Blue 하나)
+[theme]
+base = "light"
+primaryColor = "#0066cc"
+backgroundColor = "#f5f5f7"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1d1d1f"
+linkColor = "#0066cc"
+borderColor = "#e0e0e0"
+dataframeBorderColor = "#f0f0f0"
+dataframeHeaderBackgroundColor = "#fafafc"
+showWidgetBorder = true
+baseFontSize = 16
+baseRadius = "11px"
+buttonRadius = "full"
+font = "'Pretendard Variable':https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css, -apple-system, 'SF Pro Text', system-ui, sans-serif"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap, 'SF Mono', ui-monospace, monospace"
+codeBackgroundColor = "#f5f5f7"
+headingFontWeights = [600, 600, 600, 600, 600, 600]
+chartCategoricalColors = ["#0066cc", "#b76e00", "#8e44ad"]
+
+[theme.sidebar]
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f5f7"
