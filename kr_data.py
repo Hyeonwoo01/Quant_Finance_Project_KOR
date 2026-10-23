@@ -309,7 +309,7 @@ def krx_daily_all(day, market="STK"):
     """그날 상장돼 있던 전 종목의 시세·시가총액 (market: 'STK' 코스피, 'KSQ' 코스닥).
 
     그날 기준 목록이라 나중에 상장폐지된 종목도 들어 있다 → 생존 편향 없는 종목 범위를 만들 수 있다.
-    KRX가 접근 방식(로그인 등)을 바꾸면 실패할 수 있어, 아직은 연결 점검용으로만 쓴다."""
+    2026-10 점검: 로그인 없이는 'LOGOUT'(400)으로 막힘 → 실제로 쓰려면 KRX Open API 인증키가 필요하다. 지금은 연결 점검용."""
     data = {"bld": "dbms/MDC/STAT/standard/MDCSTAT01501", "locale": "ko_KR", "mktId": market,
             "trdDd": pd.Timestamp(day).strftime("%Y%m%d"), "share": "1", "money": "1", "csvxls_isNo": "false"}
     errors = []
