@@ -602,7 +602,7 @@ with tab_pick:
         st.rerun()
 
     download_note = ("처음 받을 때 코스피 전 종목 주가와, 한 번이라도 200위 안에 든 종목의 "
-                     "6년치 수급·실적·공시·재무제표를 받느라 **20~40분** 걸립니다. "
+                     "6년치 수급·실적·공시·재무제표를 받느라 **1시간 안팎** 걸립니다. "
                      "(터미널에서 `python universe.py update`로 받아도 됩니다.)")
     if info is None and weekly is None:
         st.info("아직 데이터가 없습니다. " + download_note)
