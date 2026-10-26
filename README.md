@@ -3,6 +3,7 @@
 한국 주식(코스피·코스닥) 전용 예측·검증 프로그램입니다. 미국·글로벌 버전은 [Quant_Finance_Project](https://github.com/Hyeonwoo01/Quant_Finance_Project)입니다.
 모든 예측은 **그 시점까지의 데이터로만 학습하는 워크포워드 방식**으로 검증하고, 검증 결과를 화면에 함께 보여줍니다.
 분석·검증용 도구이며 주문을 내는 실거래 시스템이 아닙니다 ([범위와 한계](#범위와-한계)).
+각 모델의 수식·쉬운 풀이·검증 방법은 **[MODELS.md](MODELS.md)** 에 정리했습니다.
 
 ![tests](https://github.com/Hyeonwoo01/Quant_Finance_Project_KOR/actions/workflows/tests.yml/badge.svg)
 
@@ -113,6 +114,7 @@ python -m venv .venv
 |---|---|
 | `app.py` | Streamlit 앱 (한국 종목 전용) |
 | `kr_costs.py` | 증권거래세(연도별)·수수료 비용 모델 |
+| `MODELS.md` | 모델 설명: 수식, 쉬운 풀이, 코드 위치, 검증 방법 |
 | `quant_engine.py` | t분포 GARCH(1,1)·시뮬레이션, VaR·ES·MDD, 겹침 보정 t값, Deflated Sharpe, 강건 회귀 등 |
 | `direction.py` | 방향 예측 + 워크포워드 자동 선택 + 가정 바꿔 점검 |
 | `regime.py` | 2상태 국면 전환 모델과 전략 평가 |
