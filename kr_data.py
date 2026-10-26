@@ -238,15 +238,16 @@ def dart_financials(stock_codes, years, key=None, pause=0.1, progress=None):
     return pd.DataFrame(out)
 
 
-def value_features(fin, index, close_raw, shares):
+def value_features(fin, index, close_raw, shares, mcap=None):
     """재무 + 주가 → 날짜별 B/M(PBR 역수), E/P(PER 역수), ROE. 공시 '다음 거래일'부터 반영.
 
-    시가총액 = (그날 종가) × (현재 상장주식수). 과거 주식수 변화(증자·소각)는 반영하지 못하는 근사."""
+    mcap: 날짜 × 종목 시가총액 (KRX의 그날 실제 값). 없으면 (그날 종가) × (현재 상장주식수) 근사 —
+    그 사이 증자·소각으로 주식수가 바뀐 종목은 과거 값에 현재 정보가 섞인다."""
     out = {k: pd.DataFrame(np.nan, index=index, columns=close_raw.columns) for k in ("bm", "ep", "roe")}
     if fin is None or fin.empty:
         return out
     for code, g in fin.groupby("code"):
-        if code not in close_raw.columns or not np.isfinite(shares.get(code, np.nan)):
+        if code not in close_raw.columns or (mcap is None and not np.isfinite(shares.get(code, np.nan))):
             continue
         quarters, events = {}, []
         for _, r in g.sort_values("rcept_dt").iterrows():
@@ -265,9 +266,9 @@ def value_features(fin, index, close_raw, shares):
         ev = ev[pos < len(index)].assign(pos=pos[pos < len(index)]).groupby("pos").last()
         eq = pd.Series(ev["equity"].values, index=index[ev.index]).reindex(index).ffill(limit=400)
         ttm = pd.Series(ev["ttm"].values, index=index[ev.index]).reindex(index).ffill(limit=400)
-        mcap = close_raw[code] * shares[code]
-        out["bm"][code] = eq / mcap
-        out["ep"][code] = ttm / mcap
+        mc = mcap[code].reindex(index) if mcap is not None and code in mcap else close_raw[code] * shares.get(code, np.nan)
+        out["bm"][code] = eq / mc
+        out["ep"][code] = ttm / mc
         out["roe"][code] = (ttm / eq).where(eq > 0)
     return out
 
@@ -301,34 +302,54 @@ def dart_features(stock_code, index, df=None):
     return out
 
 
-# ---------------- KRX 정보데이터시스템 (날짜별 전 종목 시세) ----------------
-KRX_JSON = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+# ---------------- KRX Open API (인증키, 날짜별 전 종목 일별매매정보) ----------------
+KRX_API = "https://data-dbg.krx.co.kr/svc/apis/"
+KRX_DAILY = {"STK": "sto/stk_bydd_trd", "KSQ": "sto/ksq_bydd_trd"}      # 유가증권(코스피)·코스닥 일별매매정보
+# KRX 열 이름 → 이 프로그램 이름. 종가·거래량·거래대금(원)·시가총액(원)·상장주식수, 등락률(%: 분할·증자 등을 반영한 기준가 대비)
+KRX_FIELDS = {"ISU_CD": "code", "ISU_NM": "name", "TDD_CLSPRC": "close", "FLUC_RT": "chg_pct", "ACC_TRDVOL": "volume",
+              "ACC_TRDVAL": "value", "MKTCAP": "cap", "LIST_SHRS": "shares"}
 
 
-def krx_daily_all(day, market="STK"):
-    """그날 상장돼 있던 전 종목의 시세·시가총액 (market: 'STK' 코스피, 'KSQ' 코스닥).
+def krx_api(path, day, timeout=30):
+    """KRX Open API 한 번 호출 → 행 목록 (휴장일이면 빈 목록). 인증키는 머리말(AUTH_KEY)로 보낸다."""
+    key = get_key("KRX_API_KEY")
+    if not key:
+        raise RuntimeError("KRX_API_KEY 없음")
+    r = requests.get(KRX_API + path, params={"basDd": pd.Timestamp(day).strftime("%Y%m%d")},
+                     headers={"AUTH_KEY": key}, timeout=timeout)
+    r.raise_for_status()
+    js = r.json()
+    if "OutBlock_1" not in js:
+        raise RuntimeError(f"KRX 응답 이상: {str(js)[:120]}")
+    return js["OutBlock_1"] or []
 
-    그날 기준 목록이라 나중에 상장폐지된 종목도 들어 있다 → 생존 편향 없는 종목 범위를 만들 수 있다.
-    2026-10 점검: 로그인 없이는 'LOGOUT'(400)으로 막힘 → 실제로 쓰려면 KRX Open API 인증키가 필요하다. 지금은 연결 점검용."""
-    data = {"bld": "dbms/MDC/STAT/standard/MDCSTAT01501", "locale": "ko_KR", "mktId": market,
-            "trdDd": pd.Timestamp(day).strftime("%Y%m%d"), "share": "1", "money": "1", "csvxls_isNo": "false"}
-    errors = []
-    for url in (KRX_JSON, KRX_JSON.replace("https://", "http://")):     # 주소·머리말 형식을 바꿔 가며 시도
-        try:
-            with requests.Session() as ses:
-                ses.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "X-Requested-With": "XMLHttpRequest",
-                                    "Referer": url.split("/comm/")[0] + "/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101"})
-                ses.get(url.split("/comm/")[0] + "/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101", timeout=20)
-                r = ses.post(url, data=data, timeout=20)
-            r.raise_for_status()
-            rows = r.json().get("OutBlock_1") or []
-            break
-        except Exception as e:
-            errors.append(f"{url.split(':')[0]}: {type(e).__name__} {str(e)[:120]} / 응답 앞부분 {getattr(r, 'text', '')[:80]!r}"
-                          if 'r' in locals() else f"{url.split(':')[0]}: {type(e).__name__} {str(e)[:120]}")
-            rows = []
-    if errors and not rows:
-        raise ConnectionError(" | ".join(errors))
-    if not rows:
-        raise ValueError("빈 응답 (휴장일이거나 접근이 막힘)")
-    return pd.DataFrame(rows)
+
+def parse_krx_daily(rows):
+    """일별매매정보 행 목록 → 표 (code, name, close, chg_pct, volume, value, cap, shares). 숫자의 쉼표·'-'를 정리한다.
+    종목코드가 12자리 표준코드(KR7005930003)로 오면 6자리 단축코드로 바꾼다."""
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=list(KRX_FIELDS.values()))
+    df = df[[c for c in KRX_FIELDS if c in df]].rename(columns=KRX_FIELDS)
+    for c in ("close", "chg_pct", "volume", "value", "cap", "shares"):
+        if c in df:
+            df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", "").str.strip().replace({"-": None, "": None}),
+                                  errors="coerce")
+    code = df["code"].astype(str).str.strip()
+    df["code"] = np.where(code.str.len() == 12, code.str[3:9], code)
+    return df.reset_index(drop=True)
+
+
+def krx_stock_day(day, market="STK"):
+    """그날 상장돼 있던 전 종목의 일별매매정보 (나중에 상장폐지된 종목도 그날엔 들어 있다 → 생존 편향 없는 종목 범위).
+
+    지난 날짜는 날짜별로 캐시한다 (휴장일의 빈 표도). 오늘 날짜는 장 마감 전일 수 있어 캐시하지 않는다."""
+    day = pd.Timestamp(day).normalize()
+    path = CACHE / "krx" / f"{market}_{day:%Y%m%d}.pkl"
+    if path.exists():
+        return pd.read_pickle(path)
+    df = parse_krx_daily(krx_api(KRX_DAILY[market], day))
+    if day < pd.Timestamp.now(tz="Asia/Seoul").normalize().tz_localize(None):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_pickle(path)
+    return df

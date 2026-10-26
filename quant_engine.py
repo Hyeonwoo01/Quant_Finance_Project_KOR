@@ -114,6 +114,7 @@ class GarchVolForecaster:
         self.converged = True    # 최적화가 실패해 기본값으로 대체했으면 False
         self.warnings = []       # 경계값에 닿은 추정 등 사용자에게 알릴 내용
         self.nll = np.nan        # 음의 로그우도 (같은 데이터·분포끼리 비교용, % 단위 스케일 상수 제외)
+        self.fit_info = {}       # 최적화 진단: 시작값 수, 수렴 수, 시작값별 우도 차이, 경계에 닿은 계수
 
     # 최적화가 실패했을 때 쓰는 보수적인 기본값 (주식 일간 수익률에서 흔한 수준, 장기 분산 = 표본 분산)
     FALLBACK = {"alpha": 0.05, "beta": 0.90, "nu": 8.0}
@@ -162,21 +163,25 @@ class GarchVolForecaster:
                   + ([(2.1, 200.0)] if self.dist == "t" else []))
         half_g = (lambda p: 0.5 * p[gi]) if self.asym else (lambda p: 0.0)
         cons = [{'type': 'ineq', 'fun': lambda p: 0.9999 - p[1] - p[2] - half_g(p)}]
-        # 첫 시작값으로 성공하면 그대로 쓰고(대부분), 실패하면 다른 시작값으로 차례로 다시 시도한다
+        # 시작값 셋 모두에서 최적화하고, 성공한 것 중 우도가 가장 큰(음의 로그우도가 가장 작은) 해를 쓴다.
+        # 비선형 최적화는 수렴해도 국소해일 수 있다 — 시작값에 따라 답이 달라지면 fit_info에 그 차이가 남는다.
         starts = [[0.05 * var0, 0.05, 0.90, 0.05, 8.0], [0.10 * var0, 0.10, 0.80, 0.10, 5.0], [0.02 * var0, 0.03, 0.95, 0.02, 12.0]]
         if not self.asym:
             starts = [st[:3] + st[4:] for st in starts]
-        best = None
+        best, funs = None, []
         if n >= 30 and var0 > 0:
             for x0 in starts:
                 with np.errstate(all="ignore"):
                     res = minimize(nll, x0=x0[:len(bounds)], method='SLSQP', bounds=bounds, constraints=cons)
                 ok = (res.success and np.all(np.isfinite(res.x)) and np.isfinite(res.fun)
                       and res.x[1] + res.x[2] + half_g(res.x) < 1.0)
-                if ok and (best is None or res.fun < best.fun):
-                    best = res
-                if best is not None:
-                    break
+                if ok:
+                    funs.append(float(res.fun))
+                    if best is None or res.fun < best.fun:
+                        best = res
+        # 진단: 시작값 수, 성공 수, 성공한 해들의 음의 로그우도 차이(0에 가까우면 시작값과 무관), 제약 경계에 닿은 계수
+        self.fit_info = {"시작값": len(starts), "수렴": len(funs),
+                         "우도 차이": (max(funs) - min(funs)) if len(funs) > 1 else 0.0, "경계": []}
         if best is None:                    # 추정 실패 → 기본값으로 대체하고 알린다 (조용히 틀린 값을 쓰지 않음)
             fb = self.FALLBACK
             a, b = fb["alpha"], fb["beta"]
@@ -189,6 +194,9 @@ class GarchVolForecaster:
         omega, alpha, beta = p[:3]
         self.gamma = float(p[gi]) if self.asym else 0.0
         if best is not None:
+            names = ["ω", "α", "β"] + (["γ"] if self.asym else []) + (["ν"] if self.dist == "t" else [])
+            self.fit_info["경계"] = [k for k, v, (lo, hi) in zip(names, p, bounds)
+                                    if v <= lo + 1e-6 or (hi is not None and v >= hi - 1e-6)]
             if alpha + beta + 0.5 * self.gamma > 0.995:
                 self.warnings.append("α+β가 1에 매우 가깝게 추정됐습니다 — 변동성 충격이 거의 사라지지 않는다는 뜻이라 "
                                      "장기 예측이 불안정할 수 있습니다.")
@@ -383,18 +391,41 @@ def overlap_tstat(x, h):
     if n < 2:
         return 0.0
     e = x - x.mean()
-
-    def long_run_var(lags, bartlett):
-        s = e @ e / n
-        for k in range(1, min(lags, n - 1) + 1):
-            s += 2 * (1 - k / (lags + 1) if bartlett else 1.0) * (e[k:] @ e[:-k]) / n
-        return s
-
-    s = long_run_var(h - 1, bartlett=False)
+    s = _long_run_var(e, h - 1, bartlett=False)
     if s <= 0:
-        s = long_run_var(2 * h, bartlett=True)
+        s = _long_run_var(e, 2 * h, bartlett=True)
     se = np.sqrt(max(s, 0.0) / n)
     return float(x.mean() / se) if se > 1e-15 else 0.0
+
+
+def _long_run_var(e, lags, bartlett):
+    """평균을 뺀 e의 장기 분산 (자기공분산을 시차 lags까지 더함; Bartlett 가중이면 Newey-West, 아니면 같은 가중)."""
+    n = len(e)
+    s = e @ e / n
+    for k in range(1, min(lags, n - 1) + 1):
+        s += 2 * (1 - k / (lags + 1) if bartlett else 1.0) * (e[k:] @ e[:-k]) / n
+    return s
+
+
+def hac_lags(n):
+    """Newey-West 자동 시차 ⌊4(n/100)^(2/9)⌋ (최소 1)."""
+    return max(int(np.floor(4 * (n / 100) ** (2 / 9))), 1)
+
+
+def hac_tstat(x, lags=None):
+    """평균이 0인지 검정하는 Newey-West t값 — 관측치끼리 자기상관이 있어도 표준오차가 맞도록.
+
+    리밸런싱 수익률·IC처럼 기간이 겹치지 않아도, 시장 국면·요인 수익의 지속성 때문에 서로 상관이 0이라는 보장은 없다.
+    lags: 생략하면 hac_lags(n). 표본이 3개 미만이거나 흩어짐이 0이면 nan.
+    """
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n < 3:
+        return np.nan
+    e = x - x.mean()
+    se = np.sqrt(max(_long_run_var(e, hac_lags(n) if lags is None else int(lags), bartlett=True), 0.0) / n)
+    return float(x.mean() / se) if se > 1e-15 else np.nan
 
 
 def block_bootstrap_ci(x, block, n_boot=2000, level=0.95, seed=0):
@@ -459,15 +490,21 @@ def deflated_sharpe(returns, trial_sharpes):
 
     N개를 시험하면 아무 효과가 없어도 그중 1등의 샤프는 0보다 크게 나온다(SR0 = 우연히 기대되는 1등 샤프).
     고른 설정의 샤프가 SR0보다 충분히 큰지를, 수익률의 비대칭·두꺼운 꼬리와 표본 길이까지 반영해 확률로 낸다.
+    수익률에 자기상관이 있으면 샤프 추정치가 더 흔들리므로, 표본 길이를 장기 분산 ÷ 분산(Newey-West)만큼 줄여 센다
+    (Lo 2002의 보정과 같은 생각. 음의 자기상관으로 표본을 늘리지는 않는다).
     returns: 고른 설정의 기간별 수익률. trial_sharpes: 시험한 모든 설정의 같은 기간 단위 샤프(고른 것 포함).
-    반환: dict(sr, sr0 (기간 단위), dsr = 진짜 샤프가 0보다 클 확률, n_trials, T). 샤프를 계산할 수 없으면 None.
+    반환: dict(sr, sr0 (기간 단위), dsr = 진짜 샤프가 0보다 클 확률, n_trials, T, T_eff). 샤프를 계산할 수 없으면 None.
     시험한 설정들이 서로 비슷하면(상관이 높으면) 샤프의 흩어짐이 작아 SR0도 작아진다 — 그만큼 보정이 약해진다.
+    N은 코드 안에서 비교한 설정 수뿐이다. 사람이 연구하며 바꿔 본 것(예측 기간·특징·모델 종류)은 들어가지 않으므로
+    최종 판단은 미리 적어 둔 실전 기록으로 한다 (EXPERIMENTS.md).
     """
     r = np.asarray(returns, float)
     r = r[np.isfinite(r)]
     T = len(r)
     if T < 3 or r.std(ddof=1) <= 0:
         return None
+    e = r - r.mean()
+    T_eff = T / max(_long_run_var(e, hac_lags(T), bartlett=True) / (e @ e / T), 1.0)
     sr = r.mean() / r.std(ddof=1)
     s = np.asarray(trial_sharpes, float)
     s = s[np.isfinite(s)]
@@ -475,8 +512,8 @@ def deflated_sharpe(returns, trial_sharpes):
     sr0 = (np.sqrt(s.var(ddof=1)) * ((1 - _EULER_GAMMA) * norm.ppf(1 - 1 / N) + _EULER_GAMMA * norm.ppf(1 - 1 / (N * np.e)))
            if N > 1 else 0.0)
     denom = 1 - skew(r) * sr + (kurtosis(r, fisher=False) - 1) / 4 * sr ** 2
-    dsr = float(norm.cdf((sr - sr0) * np.sqrt(T - 1) / np.sqrt(max(denom, 1e-12))))
-    return {"sr": float(sr), "sr0": float(sr0), "dsr": dsr, "n_trials": int(N), "T": int(T)}
+    dsr = float(norm.cdf((sr - sr0) * np.sqrt(max(T_eff - 1, 1.0)) / np.sqrt(max(denom, 1e-12))))
+    return {"sr": float(sr), "sr0": float(sr0), "dsr": dsr, "n_trials": int(N), "T": int(T), "T_eff": float(T_eff)}
 
 
 FF_LABELS = {"Mkt-RF": "시장", "SMB": "소형주", "HML": "가치", "RMW": "수익성", "CMA": "보수적 투자", "Mom": "모멘텀"}
@@ -539,25 +576,74 @@ def var_exception_tests(hits, p):
             "종합 p값": float(chi2.sf(lr_pof + lr_ind, 2))}
 
 
-def var_backtest(returns, levels=(0.95, 0.99), window=750, refit_every=21, start=None, dist="t", model="garch"):
-    """하루 VaR 워크포워드 검증: refit_every일마다 그때까지의 수익률로 GARCH를 다시 적합하고,
-    그 사이에는 실제 수익률로 조건부 분산만 갱신하며 매일 다음 날 VaR를 낸다 (앱 화면의 VaR와 같은 평균 0 가정).
+def _std_es(p, nu):
+    """분산이 1인 충격 분포의 아래쪽 p 꼬리 평균 크기 (양수 = 손실): −E[Z | Z ≤ q_p]. t분포 또는 정규."""
+    if np.isfinite(nu):
+        q = student_t.ppf(p, nu)
+        return float(student_t.pdf(q, nu) / p * (nu + q ** 2) / (nu - 1) * np.sqrt((nu - 2) / nu))
+    return float(norm.pdf(norm.ppf(p)) / p)
+
+
+def es_exceedance_test(loss, es, sigma):
+    """ES 검정 (McNeil·Frey 2000): 예외일마다 (실제 손실 − 예측 ES) ÷ 그날 변동성. 모델이 맞으면 평균 0.
+
+    loss·es·sigma: 예외일들의 값. 반환: (실제 손실 ÷ 예측 ES의 평균, 단측 p값 — 작으면 꼬리 손실을 작게 잡은 것).
+    예외가 3번 미만이면 p값은 nan.
+    """
+    loss, es, sigma = (np.asarray(v, float) for v in (loss, es, sigma))
+    if len(loss) == 0:
+        return np.nan, np.nan
+    ratio = float(np.mean(loss / es))
+    z = (loss - es) / sigma
+    if len(z) < 3 or z.std(ddof=1) <= 0:
+        return ratio, np.nan
+    return ratio, float(student_t.sf(z.mean() / (z.std(ddof=1) / np.sqrt(len(z))), len(z) - 1))
+
+
+def var_backtest(returns, levels=(0.95, 0.99), window=750, refit_every=21, start=None, dist="t", model="garch",
+                 detail=False):
+    """하루 VaR·ES 워크포워드 검증: refit_every일마다 그때까지의 수익률로 GARCH를 다시 적합하고,
+    그 사이에는 실제 수익률로 조건부 분산만 갱신하며 매일 다음 날 VaR·ES를 낸다 (앱 화면의 VaR와 같은 평균 0 가정).
     겹치지 않는 하루 단위라 Kupiec·Christoffersen 검정을 그대로 쓸 수 있다.
+
+    start: 검증을 시작할 위치 (기본: 최근 약 500일). 99% VaR는 500일에 예외가 5번 정도뿐이라 검정력이 약하다 —
+           실제 데이터 검증 보고서는 더 긴 기간을 쓴다.
+    예외 비율 검정에 더해: 예외일 손실 ÷ 예측 ES(1에 가까워야)와 ES 검정 p값(McNeil·Frey), 분위수 손실(모델끼리 비교용,
+    낮을수록 좋음), 재적합 수와 그중 추정에 실패해 기본값을 쓴 횟수.
+    detail=True면 (표, 날짜별 표: 수익률·변동성·수준별 VaR·ES·예외)를 돌려준다.
     """
     r = np.asarray(returns, float)
     n = len(r)
     start = max(250, n - 500) if start is None else start
-    hits = {lv: [] for lv in levels}
+    sig, V, E = [], {lv: [] for lv in levels}, {lv: [] for lv in levels}
+    n_fit = n_fail = 0
     for b in range(start, n, refit_every):
         g = fit_vol_model(r[max(0, b - window):b], model, dist)
+        n_fit, n_fail = n_fit + 1, n_fail + (not g.converged)
         zq = {lv: _std_quantile(1 - lv, g.nu) for lv in levels}
+        ze = {lv: _std_es(1 - lv, g.nu) for lv in levels}
         s2 = g.sigma2_next
         for t in range(b, min(b + refit_every, n)):
+            sd = np.sqrt(s2)
+            sig.append(sd)
             for lv in levels:
-                hits[lv].append(r[t] < zq[lv] * np.sqrt(s2))
+                V[lv].append(-zq[lv] * sd)
+                E[lv].append(ze[lv] * sd)
             s2 = g.next_var(s2, r[t] - g.mu)
-    rows = {f"하루 VaR {lv:.0%}": var_exception_tests(hits[lv], 1 - lv) for lv in levels}
-    return pd.DataFrame(rows).T
+    x, sig = r[start:], np.array(sig)
+    rows, daily = {}, {"수익률": x, "변동성": sig}
+    for lv in levels:
+        v, e = np.array(V[lv]), np.array(E[lv])
+        hit = x < -v
+        row = var_exception_tests(hit, 1 - lv)
+        row["예외일 손실 ÷ 예측 ES"], row["ES 검정 p값"] = es_exceedance_test(-x[hit], e[hit], sig[hit])
+        tau = 1 - lv
+        row["분위수 손실(×10⁴)"] = float(np.mean((x + v) * (tau - (x < -v))) * 1e4)
+        row["재적합 수"], row["추정 실패"] = n_fit, n_fail
+        rows[f"하루 VaR {lv:.0%}"] = row
+        daily.update({f"VaR {lv:.0%}": v, f"ES {lv:.0%}": e, f"예외 {lv:.0%}": hit})
+    table = pd.DataFrame(rows).T
+    return (table, pd.DataFrame(daily)) if detail else table
 
 
 def var_es(log_returns, level=0.95):
@@ -636,7 +722,7 @@ def _strategy_stats(pos, bt, h=21):
     return {"거래 수": n, "승률": (rt > 0).mean() if n else np.nan,
             "평균 손익(주가 대비)": rt.mean() if n else np.nan,
             "평균 손익(프리미엄 대비)": (rt / bt["premium"][traded]).mean() if n else np.nan,
-            "t값": rt.mean() / rt.std() * np.sqrt(n) if n > 2 and rt.std() > 0 else np.nan,
+            "t값": hac_tstat(rt.values) if n > 2 and rt.std() > 0 else np.nan,         # 자기상관 보정 (Newey-West)
             "샤프(연)": ret.mean() / ret.std() * np.sqrt(252 / h) if ret.std() > 0 else np.nan,
             "최대 낙폭": max_drawdown((1 + ret).cumprod()), "최악 1회": rt.min() if n else np.nan}, (1 + ret).cumprod()
 
@@ -718,7 +804,7 @@ def forecast_errors(bt, iv_name="IV"):
         e = d[c] - d["realized"]
         diff = e_g**2 - e**2
         rows[name] = {"예측 오차(RMSE)": float(np.sqrt(np.mean(e**2))), "평균 치우침": float(e.mean()),
-                      "GARCH 대비 개선 t값": (float(diff.mean() / diff.std() * np.sqrt(len(d)))
+                      "GARCH 대비 개선 t값": (hac_tstat(diff.values)          # 자기상관 보정 (Newey-West)
                                           if c != "garch" and diff.std() > 0 else np.nan)}
     return pd.DataFrame(rows).T, len(d)
 

@@ -48,6 +48,7 @@ jobs:
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
           ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
+          KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
         run: python universe.py weekly ${{ github.event_name == 'push' && '--smoke' || '' }}
       - name: 받은 데이터 저장 (계산이 실패하거나 시간이 넘어도 다음 실행이 이어 받도록)
         if: always() && github.event_name != 'push'

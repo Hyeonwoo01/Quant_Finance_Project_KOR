@@ -31,8 +31,8 @@ from sklearn.linear_model import Ridge
 import alt_data as ad
 import kr_data
 import repro
-from kr_costs import sell_tax_rate
-from quant_engine import deflated_sharpe, fit_vol_model, max_drawdown, ols, overlap_tstat, var_es
+from kr_costs import limit_hits, sell_tax_rate
+from quant_engine import deflated_sharpe, fit_vol_model, hac_tstat, max_drawdown, ols, overlap_tstat, var_es
 
 UDIR = kr_data.CACHE / "universe"
 UA = {"User-Agent": "Mozilla/5.0"}
@@ -79,9 +79,11 @@ def fetch_candidates(n=None):
     return df
 
 
-def point_in_time_universe(close_raw, volume, top_n=TOP_N):
-    """각 날짜의 '그때' 63일 평균 거래대금 상위 top_n (1년 이상 거래 이력 필수). 미래 정보 없음."""
-    liq = np.log((close_raw * volume).replace(0, np.nan).rolling(63, min_periods=40).mean())
+def point_in_time_universe(close_raw, volume, top_n=TOP_N, value=None):
+    """각 날짜의 '그때' 63일 평균 거래대금 상위 top_n (1년 이상 거래 이력 필수). 미래 정보 없음.
+    value: KRX의 그날 실제 거래대금(원). 있으면 그 값을, 없는 날·종목은 종가 × 거래량을 쓴다."""
+    traded = close_raw * volume if value is None else value.combine_first(close_raw * volume)
+    liq = np.log(traded.replace(0, np.nan).rolling(63, min_periods=40).mean())
     eligible = close_raw.notna() & close_raw.shift(252).notna() & liq.notna()
     return liq.where(eligible).rank(axis=1, ascending=False) <= top_n, liq
 
@@ -143,6 +145,11 @@ def update_data(years=YEARS, workers=4, progress=print, limit=None):
         for kind in ("B", "I"):                 # 주요사항보고(자사주·증자), 거래소공시(공급계약)
             _parallel(lambda c, k=kind: kr_data.dart_disclosures(c, start, kind=k), codes, workers,
                       lambda p, m: say(p, m), f"DART 공시({kind})")
+    if kr_data.get_key("KRX_API_KEY"):      # 상장폐지 종목·그날의 시가총액 (빠른 점검은 최근 60거래일만 받아 해석만 확인)
+        try:
+            update_krx(close.index if limit is None else close.index[-60:], workers, say)
+        except Exception as e:
+            say(1, f"⚠️ KRX 일별매매정보 실패 (Yahoo 주가만으로 계산): {type(e).__name__}: {str(e)[:150]}")
     _write_meta(len(codes), len(cands), years)     # 재무제표가 실패해도 나머지 데이터로 쓸 수 있게 먼저 기록
     if kr_data.get_key("DART_API_KEY"):
         try:
@@ -150,6 +157,55 @@ def update_data(years=YEARS, workers=4, progress=print, limit=None):
         except Exception as e:
             say(1, f"⚠️ DART 재무제표 실패 (나머지는 저장됨, 나중에 'python universe.py financials'): {e}")
     say(1, "완료")
+
+
+KRX_PATH = UDIR / "krx.pkl"
+_PREFERRED = re.compile(r"\d?우[A-Z]?$|우\(")       # 우선주 이름 (fetch_candidates와 같은 규칙)
+
+
+def update_krx(dates, workers=4, say=lambda p, m: print(f"[{p:4.0%}] {m}", flush=True)):
+    """KRX 유가증권 일별매매정보를 날짜별로 받아(이미 받은 날짜는 캐시) 날짜 × 종목 표로 저장한다.
+
+    그날 상장돼 있던 전 종목이라 나중에 상장폐지된 종목도 들어 있고, 그날의 시가총액·상장주식수·거래대금이 있다."""
+    frames = _parallel(lambda d: kr_data.krx_stock_day(d, "STK"), list(dates), workers, say, "KRX 일별 전 종목")
+    ok = {d: f for d, f in frames.items() if f is not None and len(f)}
+    failed = sum(f is None for f in frames.values())
+    if not ok:
+        raise RuntimeError(f"KRX 일별매매정보를 하나도 받지 못함 (실패 {failed}일)")
+    long = pd.concat([f.assign(date=pd.Timestamp(d)) for d, f in ok.items()], ignore_index=True)
+    long = long.drop_duplicates(["date", "code"], keep="last")
+    wide = {k: long.pivot(index="date", columns="code", values=k).sort_index()
+            for k in ("close", "chg_pct", "volume", "value", "cap", "shares")}
+    wide["names"] = long.sort_values("date").groupby("code")["name"].last()
+    pd.to_pickle(wide, KRX_PATH)
+    say(1, f"KRX 일별 전 종목: {len(ok)}일 · {long['code'].nunique()}종목 (받지 못한 날 {failed}일)")
+    return wide
+
+
+def load_krx(path=None):
+    p = Path(path) if path else KRX_PATH
+    return pd.read_pickle(p) if p.exists() else None
+
+
+def merge_krx(close, close_raw, volume, krx):
+    """Yahoo 주가(지금 상장된 종목) + KRX 일별매매정보(그날 상장돼 있던 전 종목) → 상장폐지 종목까지 포함한 표.
+
+    - 지금 상장된 종목: 수익률은 Yahoo 수정주가(배당 포함) 그대로.
+    - Yahoo에 없는 보통주(대부분 상장폐지): KRX 등락률(분할·증자를 반영한 기준가 대비)로 수정주가를 만들고, 마지막 거래일
+      뒤로는 그 가격에 멈춘다 → 정리매매 마지막 가격까지의 손익을 반영하고 그 뒤는 현금(수익 0)으로 본다.
+      원래 주가(close_raw)는 멈추지 않으므로 폐지 뒤엔 종목 범위에 들지 않는다.
+    반환: (close, close_raw, volume, 더한 종목 이름).
+    """
+    idx = close.index
+    names = krx["names"]
+    extra = [c for c in krx["close"].columns
+             if str(c).endswith("0") and not _PREFERRED.search(str(names.get(c, ""))) and c not in close.columns]
+    kc = krx["close"].reindex(index=idx, columns=extra)
+    growth = (1 + krx["chg_pct"].reindex(index=idx, columns=extra) / 100).where(kc.notna())
+    adj = growth.cumprod().ffill()                     # 거래 없는 날·폐지 뒤 = 직전 가격 유지 (상장 전은 비어 있음)
+    vol = krx["volume"].reindex(index=idx, columns=extra)
+    return (pd.concat([close, adj], axis=1), pd.concat([close_raw, kc], axis=1), pd.concat([volume, vol], axis=1),
+            names.reindex(extra))
 
 
 def update_financials(codes=None, start=None, say=lambda p, m: print(f"[{p:4.0%}] {m}")):
@@ -192,14 +248,27 @@ def build_panel(top_n=TOP_N, cap_limit=None, end=None):
     close_raw = pr.get("close_raw", close)
     if end is not None:
         close, close_raw, volume = close.loc[:end], close_raw.loc[:end], volume.loc[:end]
-    keep = close.columns[close.notna().sum() > 300]
+    keep = close.columns[close.notna().sum() > 252]      # 252일 이력이 없으면 어느 날에도 범위에 못 들어감 (point_in_time_universe)
     if cap_limit:
         keep = keep.intersection(cands.loc[cands["cap_rank"] <= cap_limit, "code"])
     close, close_raw, volume = close[keep], close_raw.reindex(columns=keep), volume.reindex(columns=keep)
     idx = close.index
+    value = krx_cap = None
+    n_delisted = 0
+    names = cands.set_index("code")["name"]
+    krx = load_krx()
+    if krx is not None and not cap_limit:            # 상장폐지 종목까지 포함 + 그날의 실제 거래대금·시가총액
+        close, close_raw, volume, extra_names = merge_krx(close, close_raw, volume, krx)
+        keep = close.columns[close.notna().sum() > 252]
+        close, close_raw, volume = close[keep], close_raw[keep], volume[keep]
+        value = krx["value"].reindex(index=idx, columns=close.columns)
+        krx_cap = krx["cap"].reindex(index=idx, columns=close.columns)
+        names = pd.concat([names, extra_names[~extra_names.index.isin(names.index)]])
+        added = [c for c in extra_names.index if c in keep]
+        n_delisted = int(sum(close_raw[c].last_valid_index() < idx[-1] for c in added))    # 마지막 날 전에 거래가 끝남
     lc = np.log(close)
     r = lc.diff()
-    universe, liq = point_in_time_universe(close_raw, volume, top_n)
+    universe, liq = point_in_time_universe(close_raw, volume, top_n, value)
 
     F = {
         "mom_12_1": lc.shift(21) - lc.shift(252),
@@ -243,12 +312,16 @@ def build_panel(top_n=TOP_N, cap_limit=None, end=None):
         F[k] = pd.DataFrame({c: d[k] for c, d in dd.items()}, index=idx).reindex(columns=close.columns)
 
     fin = pd.read_pickle(UDIR / "financials.pkl") if (UDIR / "financials.pkl").exists() else None
-    F.update(kr_data.value_features(fin, idx, close_raw, cands.set_index("code")["shares"]))
+    # 시가총액: KRX의 그날 실제 값(그날의 상장주식수 반영), 없는 날·종목만 '그날 주가 × 현재 상장주식수' 근사
+    cap = close_raw * cands.set_index("code")["shares"].reindex(close.columns)
+    if krx_cap is not None:
+        cap = krx_cap.combine_first(cap)
+    F.update(kr_data.value_features(fin, idx, close_raw, cands.set_index("code")["shares"], mcap=cap))
 
     coverage = {k: float(v.where(universe).notna().sum().sum() / max(universe.sum().sum(), 1)) for k, v in F.items()}
-    cap = close_raw * cands.set_index("code")["shares"].reindex(close.columns)     # 시가총액 ≈ 그날 주가 × 현재 상장주식수
-    return {"feat": F, "close": close, "universe": universe, "names": cands.set_index("code")["name"],
-            "coverage": coverage, "cap": cap}
+    return {"feat": F, "close": close, "universe": universe, "names": names,
+            "coverage": coverage, "cap": cap, "close_raw": close_raw, "volume": volume,
+            "krx": krx is not None and not cap_limit, "n_delisted": n_delisted}
 
 
 def _read_cache(name):
@@ -279,17 +352,17 @@ def composite_score(R, date, universe, cols):
 
 def walk_forward(panel, h=21, train_years=2, sample_every=5, refit_models=("ridge", "gbm"), progress=None,
                  exec_lag=1):
-    """매 h일 리밸런싱. 각 시점 t에선 결과가 확정된(날짜 ≤ t−h) 데이터로만 학습·선택한다.
+    """매 h일 리밸런싱. 각 시점 t에선 결과가 확정된(날짜 ≤ t−h−exec_lag) 데이터로만 학습·선택한다.
 
     exec_lag: t일 종가까지 보고 고른 뒤 실제로 사고파는 시점까지의 거래일 수.
               1(기본) = 다음 날 종가에 체결 → 성적은 t+1일 종가부터 h일 수익률로 매긴다. 0 = t일 종가에 체결(낙관적).
+    학습 목표도 같은 '체결 이후 h일 수익률'의 순위다 — 판단일 t → t+1 종가처럼 실제로는 얻을 수 없는 하루를 배우지 않도록.
     """
     F, close, universe = panel["feat"], panel["close"], panel["universe"]
     cols = [c for c in FEATURES if panel["coverage"].get(c, 0) > 0.3]       # 데이터가 너무 빈 신호는 제외
     R = {c: cross_rank(F[c], universe) for c in cols}
-    fwd = np.log(close.shift(-h) / close)
-    fwd_exec = np.log(close.shift(-h - exec_lag) / close.shift(-exec_lag))   # 실제 체결 이후 h일 수익률 (채점용)
-    Y = cross_rank(fwd, universe)                                            # 학습 목표: 수익률 '순위'
+    fwd_exec = np.log(close.shift(-h - exec_lag) / close.shift(-exec_lag))   # 실제 체결 이후 h일 수익률
+    Y = cross_rank(fwd_exec, universe)                                       # 학습 목표 = 채점 대상: 체결 이후 수익률 '순위'
     idx = close.index
     first = universe.any(axis=1).values.argmax() + 252 * train_years
     rebal = list(range(first, len(idx), h))
@@ -302,7 +375,7 @@ def walk_forward(panel, h=21, train_years=2, sample_every=5, refit_models=("ridg
         u = universe.loc[d]
         scores["composite"][d] = composite_score(R, d, universe, cols)
         scores["momentum"][d] = R["mom_12_1"].loc[d].where(u)
-        tr_dates = idx[universe.any(axis=1).values.argmax():t - h + 1][::sample_every]
+        tr_dates = idx[universe.any(axis=1).values.argmax():t - h - exec_lag + 1][::sample_every]   # 결과가 t까지 확정된 날만
         if len(tr_dates) > 50 and refit_models:
             keys, X = _stack(R, tr_dates, universe, cols)
             y = Y.stack().reindex(keys).values
@@ -343,7 +416,25 @@ def walk_forward(panel, h=21, train_years=2, sample_every=5, refit_models=("ridg
     scores["auto"] = pd.DataFrame(auto).T
     ic["auto"] = scores["auto"].apply(lambda row: _ic(row, fwd_r.loc[row.name]), axis=1)
     return {"scores": scores, "ic": ic, "chosen": pd.Series(chosen), "rebal": rdates, "fwd": fwd_r,
-            "cols": cols, "R": R, "h": h, "universe": universe, "exec_lag": exec_lag}
+            "cols": cols, "R": R, "h": h, "universe": universe, "exec_lag": exec_lag,
+            "blocked": _blocked_orders(panel, rdates, exec_lag)}
+
+
+def _blocked_orders(panel, rdates, exec_lag):
+    """리밸런싱(판단일)별로 체결일에 팔 수 없는/살 수 없는 종목 표.
+
+    체결일 종가가 하한가 근처면 팔 수 없고 상한가 근처면 살 수 없으며, 거래량이 0인 날(거래정지)은 둘 다 안 된다.
+    원래 주가(close_raw)가 없는 패널(합성 데이터 등)이면 None = 제약 없음."""
+    raw = panel.get("close_raw")
+    if raw is None:
+        return None
+    idx, cols = panel["close"].index, panel["universe"].columns
+    raw = raw.reindex(index=idx, columns=cols)
+    down, up = limit_hits(raw / raw.shift(1) - 1)
+    vol = panel.get("volume")
+    halt = (vol.reindex(index=idx, columns=cols) == 0) & raw.notna() if vol is not None else False
+    ex = idx[np.minimum(idx.get_indexer(rdates) + exec_lag, len(idx) - 1)]
+    return {"sell": (down | halt).loc[ex].set_axis(rdates), "buy": (up | halt).loc[ex].set_axis(rdates)}
 
 
 def _ic(score, fwd):
@@ -367,8 +458,9 @@ def evaluate(wf, cost_bps=15.0, q=5, sell_tax=False):
     uni = ret.where(univ.loc[dates]).mean(axis=1)
     ix = np.minimum(univ.index.get_indexer(dates) + wf.get("exec_lag", 0), len(univ.index) - 1)
     exec_dates = univ.index[ix]                                              # 실제로 사고파는 날 (세율은 이날 기준)
+    blocked = wf.get("blocked")
     for m, S in wf["scores"].items():
-        top_r, bot_r, turn, prev = [], [], [], None
+        top_r, bot_r, turn, prev, n_blocked = [], [], [], None, 0
         for d in dates:
             s = S.loc[d].dropna()
             if len(s) < 20:                               # 점수 없음(자동 선택이 '고르지 않음') → 전체 보유
@@ -377,7 +469,12 @@ def evaluate(wf, cost_bps=15.0, q=5, sell_tax=False):
             else:
                 k = len(s) // q
                 members = set(s.nlargest(k).index)
-                top_r.append(ret.loc[d, list(members)].mean())
+                if blocked is not None:                   # 하한가·거래정지면 못 팔아 계속 보유, 상한가·거래정지면 못 삼
+                    held = prev or set()
+                    keep = {c for c in held - members if blocked["sell"].at[d, c]}
+                    skip = {c for c in members - held if blocked["buy"].at[d, c]}
+                    members, n_blocked = (members - skip) | keep, n_blocked + len(keep) + len(skip)
+                top_r.append(ret.loc[d, list(members)].mean() if members else 0.0)      # 아무것도 못 샀으면 현금
                 bot_r.append(ret.loc[d, list(s.nsmallest(k).index)].mean())
             turn.append(1.0 if prev is None else 1 - len(members & prev) / max(len(members), 1))
             prev = members
@@ -390,12 +487,13 @@ def evaluate(wf, cost_bps=15.0, q=5, sell_tax=False):
         icm = wf["ic"][m].loc[dates].dropna()
         per_year = 252 / h
         rows[m] = {"모델": MODEL_LABELS[m], "평균 IC": icm.mean(),
-                   "IC t값": icm.mean() / icm.std() * np.sqrt(len(icm)) if len(icm) > 2 else np.nan,
+                   "IC t값": hac_tstat(icm.values),                     # 자기상관 보정 (Newey-West)
                    "IC>0 비율": (icm > 0).mean(), "상위20% 초과수익(연, 비용후)": ex.mean() * per_year,
-                   "초과수익 t값": ex.mean() / ex.std() * np.sqrt(len(ex)) if ex.std() > 0 else np.nan,
+                   "초과수익 t값": hac_tstat(ex.values),
                    "상위−하위 스프레드(연)": (top - pd.Series(bot_r, index=dates)).mean() * per_year,
                    "최대 낙폭(비용후)": max_drawdown((1 + net).cumprod()),
-                   "평균 회전율": np.mean(turn[1:]) if len(turn) > 1 else np.nan, "리밸런싱 수": len(dates)}
+                   "평균 회전율": np.mean(turn[1:]) if len(turn) > 1 else np.nan, "리밸런싱 수": len(dates),
+                   "체결 막힌 주문": n_blocked}
         curves[m] = pd.DataFrame({"상위 20% (비용 후)": (1 + net).cumprod(), "하위 20%": (1 + pd.Series(bot_r, index=dates)).cumprod()})
     curves["_universe"] = (1 + uni).cumprod()
     return pd.DataFrame(rows).T, curves
@@ -510,7 +608,7 @@ def capacity(wf, panel, curves, model="auto", capitals=(1e7, 1e8, 1e9, 1e10, 1e1
         rows[f"{cap / 1e8:,.0f}억 원" if cap >= 1e8 else f"{cap / 1e4:,.0f}만 원"] = {"주문 / 하루 거래대금 (중앙값)": float(np.median(part)) if part else np.nan,
                                 "시장 충격 비용(연)": float(np.mean(cost) * per_year),
                                 "초과수익(연, 모든 비용 후)": float(net.mean() * per_year),
-                                "t값": float(net.mean() / net.std() * np.sqrt(len(net))) if net.std() > 0 else np.nan}
+                                "t값": hac_tstat(net.values)}
     return pd.DataFrame(rows).T
 
 
@@ -664,7 +762,8 @@ def results(panel, wf, cost_bps=WEEKLY_COST, sell_tax=False):
             "pick": pick, "top": top, "bottom": bottom, "coverage": panel["coverage"], "cols": wf["cols"],
             "n_univ": int(panel["universe"].iloc[-1].sum()), "factors": factor_exposure(wf, curves),
             "selection": selection_check(curves, wf["h"]), "capacity": _optional(capacity, wf, panel, curves),
-            "risk": _optional(lambda: basket_risk(panel, current_basket(wf)))}
+            "risk": _optional(lambda: basket_risk(panel, current_basket(wf))),
+            "krx": bool(panel.get("krx")), "n_delisted": int(panel.get("n_delisted", 0))}
 
 
 def finished_end(index, now=None):

@@ -18,7 +18,7 @@ from sklearn.metrics import roc_auc_score
 
 import alt_data
 import market_data
-from kr_costs import trade_cost
+from kr_costs import apply_price_limits, trade_cost
 from quant_engine import deflated_sharpe, max_drawdown, overlap_tstat
 
 # 이 환경(sklearn 1.9 + Python 3.15)에서 학습마다 나오는 무해한 경고 — 로그가 넘치지 않게 끈다
@@ -304,17 +304,25 @@ def score(prob, fwd, h):
             "skill": 1 - brier / brier_base if brier_base > 0 else 0.0, "n": int(len(p)), "n_eff": n_eff}
 
 
-def evaluate(wf, h, daily_returns, cost_bps=0.0, threshold=0.5, lag=1, sell_tax=0.0):
+def evaluate(wf, h, daily_returns, cost_bps=0.0, threshold=0.5, lag=1, sell_tax=0.0, hold=1, price_limit=True):
     """모든 후보와 자동 선택을 채점 + 자동 선택의 '상승 확률 > threshold면 보유' 전략 vs 단순 보유.
 
     lag: t일 종가까지 보고 판단한 뒤 실제로 사고파는 시점까지의 거래일 수.
          1(기본) = 다음 날 종가에 체결 → t+1일 종가부터의 수익률을 얻음. 0 = 판단한 그 종가에 체결(낙관적).
     cost_bps: 사고팔 때 각각 내는 수수료·체결 비용. sell_tax: 팔 때만 내는 증권거래세 (숫자 또는 날짜별 Series, kr_costs).
+    hold: 1(기본) = 매일 다시 판단해 다음 하루만 들고 있음 (일일 노출 전략 — 예측 기간 h와는 다른 질문).
+          h로 주면 분할 보유: 매일 자본의 1/h를 그날 신호대로 사서 h거래일 들고 있음 → 그날 보유 비중 = 최근 h개 신호의 평균.
+          h일 예측을 그 기간 그대로 매매에 쓰는 전략이다. 한 계좌라 같은 날 사고파는 주문은 상쇄된 만큼만 비용을 낸다.
+    price_limit: 체결일에 하한가 근처로 끝났으면 팔 수 없고 상한가 근처면 살 수 없다 (kr_costs.apply_price_limits).
     """
     cols = [c for c in MODEL_LABELS if c in wf] + ["auto"]
     table = {c: score(wf[c], wf["fwd"], h) for c in cols}
 
     pos = (wf["auto"] > threshold).astype(float)
+    if hold > 1:
+        pos = pos.rolling(hold, min_periods=1).sum() / hold          # 처음 h일은 아직 안 산 몫이 현금
+    if price_limit:
+        pos = apply_price_limits(pos, daily_returns, lag)
     nxt = daily_returns.shift(-(1 + lag)).reindex(wf.index).fillna(0.0)    # t일 판단 → t+lag일 종가 체결 이후 수익률
     strat = pos * nxt - trade_cost(pos, cost_bps, sell_tax, lag)        # 비용은 체결 뒤 첫 수익과 같은 행, 세율은 체결일 기준
     equity = pd.DataFrame({"전략": np.exp(strat.cumsum()), "단순 보유": np.exp(nxt.cumsum())}, index=wf.index)
@@ -330,6 +338,28 @@ def evaluate(wf, h, daily_returns, cost_bps=0.0, threshold=0.5, lag=1, sell_tax=
 
 
 # ---------------- 가정 바꿔 점검 ----------------
+PROB_BINS = (0.0, 0.4, 0.45, 0.5, 0.55, 0.6, 1.0)
+
+
+def bucket_table(prob, fwd, cost=0.0, bins=PROB_BINS):
+    """예측 확률 구간별로 실제 h일 수익이 어땠는지: 확률이 맞는지(보정)와 오르고 내릴 때의 크기까지.
+
+    상승 확률이 50%를 넘어도 오를 때 조금 벌고 내릴 때 크게 잃으면 기대수익은 음수다:
+    E[R] = p·E[R | R > 0] + (1 − p)·E[R | R ≤ 0]. 그래서 확률만이 아니라 구간별 실제 평균 수익과 비용 뺀 값을 본다.
+    prob: 예측 확률, fwd: 그 예측의 h일 로그수익률 (같은 인덱스). cost: 한 번 사서 팔 때의 비용 (숫자 또는 같은 인덱스 Series).
+    매일 예측이라 h일 결과가 겹친다 — 관측 수는 독립 표본 수가 아니다.
+    """
+    d = pd.DataFrame({"p": prob, "r": np.expm1(fwd), "c": cost}).dropna()
+    d["구간"] = pd.cut(d["p"], bins, include_lowest=True)
+    up, dn = d["r"].where(d["r"] > 0), d["r"].where(d["r"] <= 0)
+    g = d.assign(up=up, dn=dn, net=d["r"] - d["c"]).groupby("구간", observed=False)
+    out = pd.DataFrame({"관측 수": g.size(), "평균 예측 확률": g["p"].mean(), "실제 상승 비율": g["r"].apply(lambda x: (x > 0).mean()),
+                        "평균 수익": g["r"].mean(), "오를 때 평균": g["up"].mean(), "내릴 때 평균": g["dn"].mean(),
+                        "비용 뺀 평균": g["net"].mean()})
+    out.index = [f"{lo:.0%}~{hi:.0%}" for lo, hi in zip(bins[:-1], bins[1:])]
+    return out
+
+
 def reselect(wf, h, select_window=756, min_scored=252, refit_every=21):
     """저장된 후보별 예측으로 '자동 선택'만 다시 한다 (재학습 없음).
 
