@@ -13,10 +13,12 @@
 명령줄:  python universe.py update     (처음엔 수십 분, 이후엔 새 데이터만)
 """
 import json
+import os
 import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -28,8 +30,9 @@ from sklearn.linear_model import Ridge
 
 import alt_data as ad
 import kr_data
+import repro
 from kr_costs import sell_tax_rate
-from quant_engine import deflated_sharpe, fit_vol_model, max_drawdown, ols, var_es
+from quant_engine import deflated_sharpe, fit_vol_model, max_drawdown, ols, overlap_tstat, var_es
 
 UDIR = kr_data.CACHE / "universe"
 UA = {"User-Agent": "Mozilla/5.0"}
@@ -178,14 +181,17 @@ def data_info():
 
 
 # ---------------- 특징 패널 ----------------
-def build_panel(top_n=TOP_N, cap_limit=None):
+def build_panel(top_n=TOP_N, cap_limit=None, end=None):
     """(날짜, 종목) 특징 패널. 반환: dict(feat=특징별 wide DataFrame, close, universe=bool wide, names).
 
-    cap_limit: 비교용. 주면 '현재 시총 상위 cap_limit개' 안에서만 고른다 (= 예전 방식, 생존 편향 있음)."""
+    cap_limit: 비교용. 주면 '현재 시총 상위 cap_limit개' 안에서만 고른다 (= 예전 방식, 생존 편향 있음).
+    end: 이 날짜까지만 쓴다 (장중에 받은 '오늘' 가격을 빼고 계산할 때)."""
     cands = pd.read_pickle(UDIR / "candidates.pkl")
     pr = pd.read_pickle(UDIR / "prices.pkl")
     close, volume = pr["close"], pr["volume"]
     close_raw = pr.get("close_raw", close)
+    if end is not None:
+        close, close_raw, volume = close.loc[:end], close_raw.loc[:end], volume.loc[:end]
     keep = close.columns[close.notna().sum() > 300]
     if cap_limit:
         keep = keep.intersection(cands.loc[cands["cap_rank"] <= cap_limit, "code"])
@@ -554,6 +560,143 @@ def current_picks(panel, wf, k=20):
     return d, pick, tbl.head(k), tbl.tail(k).iloc[::-1]
 
 
+# ---------------- 매주 미리 계산 (GitHub Actions) ----------------
+RANK_DIR = Path(__file__).parent / "ranking"     # 계산 결과만 저장한다 (원본 시세·수급·재무는 올리지 않음)
+RESULTS_PATH = RANK_DIR / "results.pkl"
+PICKS_PATH = RANK_DIR / "picks.csv"
+WEEKLY_COST = 5.0                   # 앱 기본 '수수료·체결 비용(bp)'과 같게
+WEEKLY_HOLDS = (63, 21)             # 앱의 '종목 교체 주기' 선택지
+RECORD_HOLD, RECORD_LAG = 63, 1     # 실전 기록에 남기는 설정 (앱 기본값)
+SCORE_HORIZONS = (21, 63)           # 기록한 추천을 채점하는 기간 (거래일)
+KR_CLOSE_DONE = 15 * 60 + 30 + 40   # 한국 장 마감 15:30 + 여유 40분 (forecast_log와 같은 기준)
+PICK_COLUMNS = ["date", "model", "n", "codes", "names",
+                *[f"{k}_{h}" for h in SCORE_HORIZONS for k in ("basket", "market")], "version"]
+
+
+def _optional(fn, *args):
+    """부가 분석은 실패해도 나머지를 막지 않는다 (데이터 열이 빠진 경우 등) → None."""
+    try:
+        return fn(*args)
+    except Exception:
+        return None
+
+
+def results(panel, wf, cost_bps=WEEKLY_COST, sell_tax=False):
+    """앱 '코스피 종목 고르기' 탭이 보여 주는 결과 묶음. 계산 결과만 들어 있고 원본 시세는 없다."""
+    table, curves = evaluate(wf, cost_bps, sell_tax=sell_tax)
+    d, pick, top, bottom = current_picks(panel, wf)
+    return {"table": table, "curves": curves, "ic": wf["ic"]["auto"], "chosen": wf["chosen"], "date": d,
+            "pick": pick, "top": top, "bottom": bottom, "coverage": panel["coverage"], "cols": wf["cols"],
+            "n_univ": int(panel["universe"].iloc[-1].sum()), "factors": factor_exposure(wf, curves),
+            "selection": selection_check(curves, wf["h"]), "capacity": _optional(capacity, wf, panel, curves),
+            "risk": _optional(lambda: basket_risk(panel, current_basket(wf)))}
+
+
+def finished_end(index, now=None):
+    """마지막 날이 '오늘'이고 한국 장이 아직 마감 전(여유 포함)이면 그 전 거래일, 아니면 마지막 날.
+    장중에 수동으로 돌려도 움직이는 중인 가격으로 추천을 기록하지 않도록."""
+    local = (now or pd.Timestamp.now(tz="UTC")).tz_convert("Asia/Seoul")
+    if len(index) > 1 and index[-1].date() == local.date() and local.hour * 60 + local.minute < KR_CLOSE_DONE:
+        return index[-2]
+    return index[-1]
+
+
+def read_picks(path=PICKS_PATH):
+    """매주 미리 적어 둔 추천 기록 (없으면 빈 표)."""
+    if not Path(path).exists():
+        return pd.DataFrame(columns=PICK_COLUMNS)
+    return pd.read_csv(path, dtype={"date": str, "model": str, "codes": str, "names": str, "version": str})
+
+
+def record_picks(log, wf, panel, version=""):
+    """이번 추천(앱에 보이는 순위의 상위 20%)을 기록에 추가. 같은 날짜가 이미 있으면 그대로 둔다 (미리 적어 둔 기록은 고치지 않음)."""
+    d = wf["rebal"][-1]
+    if (log["date"].astype(str) == d.date().isoformat()).any():
+        return log
+    codes = current_basket(wf)
+    row = pd.DataFrame([{"date": d.date().isoformat(), "model": wf["chosen"].loc[d], "n": len(codes),
+                         "codes": " ".join(codes), "names": ", ".join(panel["names"].reindex(codes).fillna("").astype(str)),
+                         "version": version}]).reindex(columns=PICK_COLUMNS)
+    return row if log.empty else pd.concat([log, row], ignore_index=True)
+
+
+def score_picks(log, panel, lag=RECORD_LAG, horizons=SCORE_HORIZONS):
+    """기록한 추천의 실제 성적: 기록 다음 거래일 종가에 사서 h거래일 뒤까지(비용 전),
+    바구니(동일 비중) vs 그날 종목 범위 전체(동일 비중). 기간이 아직 안 끝난 기록은 비워 둔다."""
+    close, univ, idx = panel["close"], panel["universe"], panel["close"].index
+    out = log.copy()
+    for col in (f"{k}_{h}" for h in horizons for k in ("basket", "market")):
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype(float)
+    for k, r in out.iterrows():
+        i = idx.searchsorted(pd.Timestamp(r["date"]), side="right") - 1
+        if i < 0:
+            continue
+        codes = [c for c in str(r["codes"]).split() if c in close.columns]
+        members = univ.columns[univ.iloc[i].values]
+        for h in horizons:
+            if i + lag + h >= len(idx):
+                continue
+            g = close.iloc[i + lag + h] / close.iloc[i + lag] - 1
+            out.at[k, f"basket_{h}"] = float(g.reindex(codes).mean())
+            out.at[k, f"market_{h}"] = float(g.reindex(members).mean())
+    return out
+
+
+def picks_summary(log, horizons=SCORE_HORIZONS, every=5):
+    """채점 기간별 채점 수·평균 초과수익·전체 평균보다 나은 비율·t값.
+    기록이 매주(약 every거래일 간격)라 h거래일 성적이 서로 겹친다 → 겹침 보정 t값 (Hansen-Hodrick)."""
+    rows = {}
+    for h in horizons:
+        ex = (pd.to_numeric(log[f"basket_{h}"], errors="coerce") - pd.to_numeric(log[f"market_{h}"], errors="coerce")).dropna()
+        rows[f"{h}거래일"] = {"채점 수": float(len(ex)), "평균 초과수익": ex.mean() if len(ex) else np.nan,
+                          "전체 평균보다 나은 비율": (ex > 0).mean() if len(ex) else np.nan,
+                          "t값 (겹침 보정)": overlap_tstat(ex.values, int(np.ceil(h / every))) if len(ex) > 2 else np.nan}
+    return pd.DataFrame(rows).T
+
+
+def load_weekly(path=RESULTS_PATH):
+    """GitHub Actions가 매주 계산해 둔 결과 (없으면 None)."""
+    return pd.read_pickle(path) if Path(path).exists() else None
+
+
+def weekly_stamp(path=RESULTS_PATH):
+    """결과 파일이 바뀌면 달라지는 값 (앱 캐시 키)."""
+    return Path(path).stat().st_mtime if Path(path).exists() else None
+
+
+def weekly(update=True, panel=None, out_dir=RANK_DIR, now=None, refit_models=("ridge", "gbm"), progress=print):
+    """GitHub Actions가 매주 돌리는 일 (python universe.py weekly).
+
+    ① 데이터 갱신 ② 앱 설정 조합(교체 주기 × 체결 시점 × 증권거래세)마다 탭에 보일 결과를 계산해 results.pkl로 저장
+    ③ 이번 추천(앱 기본 설정)을 picks.csv에 미리 적고, 기간이 지난 추천을 채점. 원본 시세·수급·재무는 저장하지 않는다.
+    panel: 테스트용 (주면 데이터를 받지 않고 그 패널로 계산)."""
+    say = (lambda p, m: progress(p, m)) if progress is not print else (lambda p, m: print(f"[{p:4.0%}] {m}", flush=True))
+    if panel is None:
+        if update:
+            update_data(progress=progress)
+        prices = pd.read_pickle(UDIR / "prices.pkl")
+        panel = build_panel(end=finished_end(prices["close"].index, now))
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    version = os.environ.get("GITHUB_SHA", "")[:7] or repro.code_version()
+    combos = [(h, lag) for h in WEEKLY_HOLDS for lag in (1, 0)]
+    res, rec = {}, None
+    for j, (h, lag) in enumerate(combos):
+        say(j / len(combos), f"계산: 교체 주기 {h}거래일, 체결 {'다음 날' if lag else '그날'} 종가")
+        wf = walk_forward(panel, h, refit_models=refit_models, exec_lag=lag)
+        for tax in (True, False):
+            res[(h, lag, tax)] = results(panel, wf, WEEKLY_COST, tax)
+        if (h, lag) == (RECORD_HOLD, RECORD_LAG):
+            rec = wf
+    pd.to_pickle({"updated": pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d %H:%M"),
+                  "data_end": panel["close"].index[-1], "cost_bps": WEEKLY_COST, "results": res,
+                  "meta": data_info(), "version": version}, out_dir / RESULTS_PATH.name)
+    log = score_picks(record_picks(read_picks(out_dir / PICKS_PATH.name), rec, panel, version), panel)
+    log.to_csv(out_dir / PICKS_PATH.name, index=False)
+    say(1, f"완료: 설정 {len(res)}개, 데이터 {panel['close'].index[-1].date()}까지, 추천 기록 {len(log)}줄")
+    return res, log
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     t0 = time.time()
@@ -561,6 +704,8 @@ if __name__ == "__main__":
         update_data()
     elif cmd == "financials":          # DART 재무제표만 (차단 등으로 실패했을 때)
         update_financials()
+    elif cmd == "weekly":              # GitHub Actions (.github/workflows/ranking.yml)
+        weekly()
     else:
-        print("사용법: python universe.py update | financials")
+        print("사용법: python universe.py update | financials | weekly")
     print(f"총 {time.time() - t0:.0f}초")

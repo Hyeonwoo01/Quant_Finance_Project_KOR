@@ -243,12 +243,19 @@ def sentiment_check(rows, h, min_n=10):
 
 
 def check():
-    """데이터 연결 점검 (GitHub Actions에서 코드가 바뀔 때마다): 지수·주식·ETF 예측을 받아 보고, KRX 전 종목 시세 접근도 확인."""
+    """데이터 연결 점검 (GitHub Actions에서 코드가 바뀔 때마다): 지수·주식·ETF 예측, 코스피200(네이버 차트), KRX 전 종목 시세 접근을 확인."""
     ok = True
     for t in ("^KS11", "005930.KS", "069500.KS"):
         row = _predict_retry(t, tries=2, wait=20)
         ok &= row is not None
         print(t, row, flush=True)
+    try:                                       # 코스피200은 Yahoo에 기록이 거의 없어 네이버 차트에서 받는다
+        k2 = md.load_history("^KS200", 1)
+        print(f"코스피200: {len(k2)}일, {k2.index[0].date()} ~ {k2.index[-1].date()}, 마지막 {k2.iloc[-1]:.2f}", flush=True)
+        ok &= len(k2) > 200
+    except Exception as e:
+        print(f"코스피200: 받지 못함 ({type(e).__name__}: {str(e)[:200]})", flush=True)
+        ok = False
     import kr_data
     try:
         snap = kr_data.krx_daily_all(pd.Timestamp.now(tz="Asia/Seoul").normalize().tz_localize(None) - pd.offsets.BDay(1))

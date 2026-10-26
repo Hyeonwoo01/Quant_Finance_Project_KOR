@@ -295,7 +295,19 @@ $`\alpha`$가 0 근처면 새로운 신호가 아니라 이미 알려진 효과�
 ### 지금 고른 종목들의 위험
 지금 상위 20% 종목을 같은 비중으로 지난 3년 들고 있었다면: 하루 VaR·ES(과거 실제), GARCH로 본 내일 VaR, 최악의 날·달, 시장 베타, 시장 급락일 손실.
 
-코드: `cross_rank`, `composite_score`, `walk_forward`, `evaluate`, `factor_exposure`, `selection_check`, `capacity`, `basket_risk` (`universe.py`).
+### 실전 기록 (매주)
+매주 금요일 장 마감 뒤 GitHub Actions가 그 주의 상위 20% 바구니(교체 주기 63거래일 기준)를 `ranking/picks.csv`에 미리 적어 둡니다.
+기록일 t에 대해 다음 거래일 종가에 사서 h거래일 뒤까지(비용 전):
+
+```math
+\text{초과수익}_t(h) = \frac{1}{\lvert B_t\rvert}\sum_{i \in B_t}\Big(\frac{S_{i,t+1+h}}{S_{i,t+1}} - 1\Big) - \frac{1}{\lvert U_t\rvert}\sum_{i \in U_t}\Big(\frac{S_{i,t+1+h}}{S_{i,t+1}} - 1\Big), \qquad h = 21,\ 63
+```
+
+$`B_t`$ = 기록한 바구니, $`U_t`$ = 그날 종목 범위(거래대금 상위 200). 매주(약 5거래일 간격) 기록해 h일 성적이 서로 겹치므로,
+평균의 t값은 [겹침 보정](#겹침-보정-t값-hansen-hodrick)(시차 $`\lceil h/5\rceil - 1`$)으로 냅니다.
+
+코드: `cross_rank`, `composite_score`, `walk_forward`, `evaluate`, `factor_exposure`, `selection_check`, `capacity`, `basket_risk`,
+`weekly`, `record_picks`, `score_picks`, `picks_summary` (`universe.py`).
 
 ---
 
@@ -369,4 +381,4 @@ $`\beta`$ = 평균 노출, $`\alpha`$ = 같은 비중으로 계속 들고 있던
 
 21거래일 뒤 결과가 나오면 앱이 채점합니다: 방향 적중률, 확률 정확도 개선과 z (그날 기록한 기본 확률 대비), 68%·95% 범위 적중률, 하루 VaR 예외 검정, GARCH(와 있으면 IV·변동성 지수)의 변동성 오차, 국면별 실제 변동성, 심리 지표와 이후 수익률·변동성의 관계(겹침 보정 t값).
 
-코드: `predict`, `score`, `sentiment_check` (`forecast_log.py`).
+코드: `predict`, `score`, `sentiment_check` (`forecast_log.py`). 코스피 종목 고르기의 매주 추천 기록은 [5장](#실전-기록-매주)에 있습니다.
