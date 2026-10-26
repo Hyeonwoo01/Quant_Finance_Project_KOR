@@ -102,6 +102,27 @@ _rej = np.mean([abs(overlap_tstat(np.convolve(_g.standard_normal(2520), np.ones(
                 for _ in range(1000)])
 assert 0.025 < _rej < 0.08, _rej
 
+
+def _garch_t(T, R, g):
+    """실제 수익률에 가까운 합성 일간 수익률 R개 (T일): GARCH(1,1) 변동성 군집 + t(5) 두꺼운 꼬리, 평균 0."""
+    z = g.standard_t(5, size=(T + 300, R)) / np.sqrt(5 / 3)
+    out, s2 = np.empty((T + 300, R)), np.full(R, 1e-4)
+    for t in range(T + 300):
+        out[t] = np.sqrt(s2) * z[t]
+        s2 = 2e-6 + 0.08 * out[t] ** 2 + 0.9 * s2
+    return out[300:]
+
+
+# 같은 검정을 실제와 비슷한 조건에서: '63일 모멘텀이 양수면 오른다'(예측력 없음)를 21일 결과로 채점한 적중 차이.
+# 진짜 차이는 0인데 '유의'가 나오는 비율이 5% 근처여야 하고, 겹침을 무시한 보통 t값은 크게 과대평가해야 한다
+_nd, _R = 1700, 500
+_cg = np.vstack([np.zeros(_R), np.cumsum(_garch_t(_nd + 85, _R, np.random.default_rng(7)), 0)])
+_up = (_cg[63 + 21:63 + 21 + _nd] - _cg[63:63 + _nd] > 0).astype(float)
+_d = ((_cg[63:63 + _nd] - _cg[:_nd] > 0) == _up).astype(float) - _up
+_rej_hh = np.mean([abs(overlap_tstat(_d[:, i], 21)) > 1.96 for i in range(_R)])
+_rej_naive = np.mean([abs(_d[:, i].mean() / _d[:, i].std() * np.sqrt(_nd)) > 1.96 for i in range(_R)])
+assert 0.025 < _rej_hh < 0.10 and _rej_naive > 0.4, (_rej_hh, _rej_naive)
+
 # 파이프라인이 '실제로 예측 가능한' 데이터에선 신호를 찾아내는지 (모멘텀이 있는 합성 가격)
 r = np.zeros(2500)
 for t in range(2500):
@@ -777,6 +798,14 @@ _w1 = np.subtract(*qe.block_bootstrap_ci(_ar, 1)[::-1])
 _w50 = np.subtract(*qe.block_bootstrap_ci(_ar, 50)[::-1])
 assert 2.3 < _w50 / _w1 < 3.7                     # 자기상관 0.8이면 이론상 √((1+0.8)/(1−0.8)) = 3배 넓어야
 assert np.isnan(qe.block_bootstrap_ci(_x[:50], 42)[0])                # 표본이 블록 2배보다 짧으면 계산하지 않음
+# 실제와 비슷한 조건(GARCH·t(5))에서 '63일 모멘텀이 양수면 보유, 다음 날 체결' 전략의 일간 초과수익(진짜 평균 0):
+# 검증 보고서와 같은 b = 42의 95% 구간이 실제로 0을 95% 가까이 포함해야 한다
+_nb = 1700
+_rg = _garch_t(_nb + 70, 200, np.random.default_rng(5))
+_cc = np.vstack([np.zeros(200), np.cumsum(_rg, 0)])
+_exr = ((_cc[63:63 + _nb] - _cc[:_nb] > 0) - 1.0) * _rg[64:64 + _nb]
+_cov = np.mean([(lambda lo, hi: lo <= 0 <= hi)(*qe.block_bootstrap_ci(_exr[:, i], 42, n_boot=500)) for i in range(200)])
+assert _cov > 0.9, _cov
 
 # ---------------- 실제 데이터 검증 보고서 (데이터는 합성으로 바꿔 끼움) ----------------
 import validation as vd
