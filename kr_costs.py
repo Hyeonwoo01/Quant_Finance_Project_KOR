@@ -60,3 +60,42 @@ def trade_cost(pos, cost_bps=0.0, sell_tax=0.0, lag=0):
     else:
         tax = sell_tax
     return d.abs() * cost_bps * 1e-4 + (-d).clip(lower=0) * tax
+
+
+# 가격제한폭: 하루에 전날 종가 대비 이만큼까지만 움직일 수 있다 (2015-06-15부터 ±30%, 그 전 ±15%)
+PRICE_LIMIT = [("1998-12-07", 0.15), ("2015-06-15", 0.30)]
+LIMIT_MARGIN = 0.005             # 호가 단위로 딱 맞지 않는 만큼 — 제한폭에서 0.5%p 이내로 끝나면 제한폭에 걸린 날로 본다
+
+
+def limit_rate(dates):
+    """날짜별 가격제한폭 (소수)."""
+    idx = pd.DatetimeIndex(dates)
+    starts = pd.DatetimeIndex([r[0] for r in PRICE_LIMIT])
+    rates = np.array([r[1] for r in PRICE_LIMIT])
+    return pd.Series(rates[np.maximum(starts.searchsorted(idx, side="right") - 1, 0)], index=idx)
+
+
+def limit_hits(simple_returns):
+    """날짜별 (하한가 근처로 끝남, 상한가 근처로 끝남) — simple_returns: 전날 종가 대비 등락률 (Series 또는 DataFrame).
+
+    하한가로 끝난 날은 팔자 주문이 쌓여 종가에 팔 수 없고, 상한가로 끝난 날은 살 수 없다고 본다."""
+    lim = limit_rate(simple_returns.index) - LIMIT_MARGIN
+    if isinstance(simple_returns, pd.DataFrame):
+        return simple_returns.le(-lim, axis=0), simple_returns.ge(lim, axis=0)
+    return simple_returns <= -lim, simple_returns >= lim
+
+
+def apply_price_limits(target, daily_log_returns, lag=1):
+    """원하는 보유 비중(판단일별) → 가격제한폭 때문에 실제로 가질 수 있었던 비중.
+
+    판단일 t의 주문은 t+lag일 종가에 체결된다. 그날 하한가 근처로 끝났으면 줄이는(파는) 주문이, 상한가 근처로 끝났으면
+    늘리는(사는) 주문이 체결되지 않아 직전 비중을 유지하고 다음 날 다시 시도한다. 지수는 제한폭에 닿을 일이 없어 그대로.
+    """
+    move = np.expm1(daily_log_returns).shift(-lag).reindex(target.index)
+    down, up = limit_hits(move.fillna(0.0))
+    out, prev = np.empty(len(target)), 0.0
+    for i, (w, dn, u) in enumerate(zip(target.values, down.values, up.values)):
+        if (w < prev and dn) or (w > prev and u):
+            w = prev
+        out[i] = prev = w
+    return pd.Series(out, index=target.index)

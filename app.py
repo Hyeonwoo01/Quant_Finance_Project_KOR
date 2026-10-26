@@ -32,7 +32,7 @@ import regime as rg
 import repro
 import ui
 import universe as uv
-from quant_engine import GarchVolForecaster, max_drawdown, timing_attribution, var_backtest, var_es
+from quant_engine import GarchVolForecaster, hac_tstat, max_drawdown, timing_attribution, var_backtest, var_es
 from quant_engine import VOL_MODELS, fit_vol_model
 
 for _m in _LOCAL_MODULES:                    # 다음 실행 때 파일이 바뀌었는지 비교할 기준
@@ -375,7 +375,8 @@ with tab1:
     ui.section("Price Range Forecast", f"앞으로 {horizon}거래일, 주가가 움직일 범위",
                "최근 변동성을 바탕으로 주가가 얼마나 크게 움직일 수 있는지 보여줍니다. "
                "진한 띠 안에 머물 확률은 약 68%, 연한 띠는 약 95%입니다. 폭락·폭등이 정규분포보다 자주 나오는 점을 "
-               f"t분포 {garch.name}로 반영해 1만 번 시뮬레이션했습니다. 오를지 내릴지는 <b>방향 예측</b> 탭에서 봅니다.")
+               f"t분포 {garch.name}로 반영해 1만 번 시뮬레이션했습니다. 범위의 중심은 <b>현재가</b>입니다(평균 수익 0 가정) — "
+               "기대 가격이나 오를지 내릴지의 예측이 아니라 불확실성의 크기입니다. 오를지 내릴지는 <b>방향 예측</b> 탭에서 봅니다.")
     if not garch.converged:
         st.warning(garch.warnings[0] + " 범위와 VaR는 이 기본값으로 계산했으니 참고만 하세요.")
     cum_sd = np.sqrt(np.cumsum(garch.daily_var_path(horizon)))     # k일 누적 로그수익률 표준편차
@@ -392,7 +393,7 @@ with tab1:
         fig.add_trace(go.Scatter(x=x, y=[spot, *hi], line=dict(width=0), showlegend=False, hoverinfo="skip"))
         fig.add_trace(go.Scatter(x=x, y=[spot, *lo], fill="tonexty", fillcolor=color, line=dict(width=0),
                                  name=f"{p:.0%} 범위"))
-    fig.add_trace(go.Scatter(x=[close.index[-1], fut_idx[-1]], y=[spot, spot], name="중앙값",
+    fig.add_trace(go.Scatter(x=[close.index[-1], fut_idx[-1]], y=[spot, spot], name="현재가 (평균 0 가정, 기대 가격 아님)",
                              line=dict(color=ui.NEUTRAL, dash="dot")))
     fig.update_layout(height=460, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                       legend=dict(orientation="h", y=1.08))
@@ -441,11 +442,15 @@ with tab_dir:
                     ("과거 검증 통과", "approve") if reliable else ("과거 검증 미통과", "elective")],
                    "최대 10년치 하루 주가로 여러 모델을 시험해, 최근 3년 동안 가장 잘 맞힌 모델을 골랐습니다.")
         ui.badges("모델에 들어간 데이터", [("가격 특징 · 사용", "approve")] + [
-            (f"{k} · {'사용' if v.startswith('사용') else '키 없음' if v == '키 없음' else '오류' if v.startswith('오류') else '없음'}",
+            (f"{k} · {'사용' if v.startswith('사용') else '키 없음' if v == '키 없음' else '오류' if v.startswith('오류') else '기간 짧아 제외' if v.startswith('기간이 짧아') else '없음'}",
              "approve" if v.startswith("사용") else "neutral" if v == "키 없음" else
              "reject" if v.startswith("오류") else "neutral") for k, v in alt_status.items()])
         if any(v == "키 없음" for v in alt_status.values()):
             st.caption("키 없음 = API 키가 없어 꺼짐. `api_keys.env` 파일에 `DART_API_KEY=…`, `ECOS_API_KEY=…`를 넣으면 켜집니다.")
+        short = {k: v for k, v in alt_status.items() if v.startswith("기간이 짧아")}
+        if short:
+            st.caption("기간 짧아 제외 = 가격 기록의 뒤쪽 절반에서야 시작하는 데이터. 넣으면 학습·검증 기간이 절반 넘게 줄어서 뺐습니다 ("
+                       + " / ".join(f"{k}: {v.split('(')[-1].rstrip(')')}" for k, v in short.items()) + ").")
         errs = {k: v for k, v in alt_status.items() if v.startswith("오류")}
         if errs:
             st.caption(" / ".join(f"{k}: {v}" for k, v in errs.items()))
@@ -497,6 +502,17 @@ with tab_dir:
             st.caption(f"검증 기간 동안 자동 선택된 비율: {share}. "
                        "구분력(AUC)은 오를 때와 내릴 때를 얼마나 잘 가르는지(0.5면 동전 던지기), "
                        "확률 정확도 개선은 과거 상승 비율을 그대로 쓸 때보다 확률이 몇 % 더 정확한지입니다.")
+            with st.expander("상승 확률 구간별로 실제 수익은 얼마였나? (확률만으로는 부족한 이유)"):
+                tx = sell_tax_for(close_long.index, kind, use_tax)
+                tx = tx.shift(-(exec_lag + dir_h)).reindex(wf.index).ffill() if isinstance(tx, pd.Series) else tx
+                bt = dr.bucket_table(wf["auto"], wf["fwd"], 2 * cost_bps * 1e-4 + tx)
+                st.dataframe(bt.style.format({"관측 수": "{:,.0f}", "평균 예측 확률": "{:.1%}", "실제 상승 비율": "{:.1%}",
+                                              "평균 수익": "{:+.2%}", "오를 때 평균": "{:+.2%}", "내릴 때 평균": "{:+.2%}",
+                                              "비용 뺀 평균": "{:+.2%}"}, na_rep="—"), width="stretch")
+                st.caption("오를 확률이 높아도 오를 때 조금 벌고 내릴 때 크게 잃으면 평균 수익은 음수입니다: "
+                           "평균 수익 = 상승 비율 × 오를 때 평균 + (1 − 상승 비율) × 내릴 때 평균. "
+                           f"수익은 판단일 종가 → {dir_h}거래일 뒤 종가, 비용은 한 번 사서 팔 때의 수수료·세금입니다. "
+                           "매일 예측이라 결과가 겹쳐서 관측 수는 독립 표본 수가 아닙니다.")
 
             st.markdown(f"**상승 확률이 50%를 넘을 때만 들고 있었다면?** 단순 보유와 비교 "
                         f"(체결: {exec_word}, {cost_word}, 주식을 들고 있던 기간 {ev['time_in_market']:.0%}, "
@@ -720,13 +736,17 @@ with tab_pick:
                 "평균 IC": "{:+.3f}", "IC t값": "{:+.1f}", "IC>0 비율": "{:.0%}",
                 "상위20% 초과수익(연, 비용후)": "{:+.1%}", "초과수익 t값": "{:+.1f}",
                 "상위−하위 스프레드(연)": "{:+.1%}", "최대 낙폭(비용후)": "{:.0%}",
-                "평균 회전율": "{:.0%}", "리밸런싱 수": "{:.0f}"}, na_rep="—"),
+                "평균 회전율": "{:.0%}", "리밸런싱 수": "{:.0f}", "체결 막힌 주문": "{:.0f}"}, na_rep="—"),
                 hide_index=True, width="stretch")
             share = U["chosen"].value_counts(normalize=True)
             st.caption("자동 선택 비율: " + ", ".join(
                 f"{uv.MODEL_LABELS.get(k, '고르지 않음')} {v:.0%}" for k, v in share.items()) +
                 ". IC(순위 정확도)는 점수 순위와 실제 수익률 순위가 얼마나 일치하는지입니다. "
-                "0이면 무관하고 0.05 정도면 실무에서 의미 있는 수준입니다. t값이 2를 넘으면 우연일 가능성이 낮다고 봅니다.")
+                "0이면 무관하고 0.05 정도면 실무에서 의미 있는 수준입니다. t값이 2를 넘으면 우연일 가능성이 낮다고 봅니다 "
+                "(리밸런싱끼리의 자기상관을 반영한 Newey-West t값). 체결 막힌 주문 = 체결일에 하한가·거래정지라 못 판 종목(계속 보유)과 "
+                "상한가·거래정지라 못 산 종목의 수. '(기준)' 모델은 같은 조건으로 비교만 하고 자동 선택 후보에는 넣지 않습니다."
+                + (f" 자동 선택이 고른 모델이 바뀐 횟수: 리밸런싱 {len(U['chosen'])}번 중 {U['switches']}번 "
+                   "(자주 바뀌면 모델 고르기가 운에 좌우된다는 뜻)." if U.get("switches") is not None else ""))
             sel = U.get("selection")
             if sel is not None:
                 st.caption(f"이 표의 1등({uv.MODEL_LABELS[sel['best']]})을 나중에 고르면 생기는 착시 보정: 효과가 없어도 {sel['n_trials']}개 중 "
@@ -753,6 +773,31 @@ with tab_pick:
                 st.caption("한 번 사거나 팔 때 추가 비용 ≈ 하루 변동성 × √(주문 금액 ÷ 하루 거래대금)으로 계산했습니다 (시장 충격의 '제곱근 법칙', "
                            "계수 1로 보수적으로). 종목당 주문 금액 = 자본 ÷ 보유 종목 수, 거래대금은 그날 기준 63일 평균입니다. "
                            "초과수익이 0 아래로 떨어지기 시작하는 규모가 이 전략을 실제로 굴릴 수 있는 대략적인 한계입니다.")
+            cs = U.get("cost_sens")
+            if cs is not None:
+                cs_tab, breakeven = cs
+                st.markdown("**수수료·슬리피지가 더 크면?** — 매수·매도 각각의 비용(bp)을 바꿔 자동 선택 상위 20%를 다시 계산")
+                st.dataframe(cs_tab.style.format({"초과수익(연, 비용후)": "{:+.1%}", "t값": _signed(1), "최대 낙폭(비용후)": "{:.0%}"},
+                                                 na_rep="—"), width="stretch")
+                st.caption((f"손익분기 비용: 매수·매도 각각 약 {breakeven:.0f}bp를 넘으면 초과수익이 0 아래로 내려갑니다. "
+                            if np.isfinite(breakeven) else "비용이 0이어도 초과수익이 없어 손익분기 비용을 계산하지 않습니다. ")
+                           + "실제 체결가가 종가보다 몇 bp만 불리해도 무너지는 신호라면 실전에서 쓰기 어렵습니다.")
+            rw = U.get("risk_weighted")
+            if rw is not None:
+                a0 = U["table"].loc["auto"]
+                st.markdown("**위험을 비중에 반영하면?** — 같은 종목을 63일 변동성의 역수에 비례해 담음 (종목당 동일 비중의 2배 상한)")
+                st.dataframe(pd.DataFrame({"동일 비중": a0, "변동성 역가중": rw}).T[
+                    ["상위20% 초과수익(연, 비용후)", "초과수익 t값", "최대 낙폭(비용후)", "평균 회전율"]].style.format(
+                    {"상위20% 초과수익(연, 비용후)": "{:+.1%}", "초과수익 t값": _signed(1), "최대 낙폭(비용후)": "{:.0%}",
+                     "평균 회전율": "{:.0%}"}, na_rep="—"), width="stretch")
+                st.caption("변동성이 큰 종목을 덜 담아 포트폴리오 흔들림을 줄이는 가장 단순한 위험 예산입니다. 업종·베타 제한이나 "
+                           "종목 간 상관을 고려한 최적화는 하지 않습니다.")
+            mk = U.get("market")
+            if mk is not None:
+                st.markdown("**시장 상황별로는?** — 리밸런싱 기간을 그 기간 종목 범위 평균 수익률로 하락·횡보·상승 셋으로 나눔")
+                st.dataframe(mk.style.format({"기간 수": "{:.0f}", "시장 평균(기간)": "{:+.1%}", "초과수익 평균(기간)": "{:+.2%}",
+                                              "초과 > 0 비율": "{:.0%}"}, na_rep="—"), width="stretch")
+                st.caption("특정 시장(예: 상승장)에서만 초과수익이 났다면 그 신호는 시장 상황에 기대는 것일 수 있습니다. 기간 수가 적어 참고용입니다.")
             rk = U.get("risk")
             if rk is not None:
                 st.markdown(f"**지금 고른 {rk['n']}종목을 같은 비중으로 들고 있으면?** — 지난 {rk['days']}거래일 동안 그대로 들고 있었다고 보고 계산")
@@ -793,9 +838,9 @@ with tab_pick:
                                       hovermode="x unified", legend=dict(orientation="h", y=1.1))
                     ui.chart(fig)
                     yr = pd.DataFrame({"연 평균": kf[cols].mean() * 252, "연 변동성": kf[cols].std() * np.sqrt(252),
-                                       "t값": kf[cols].mean() / kf[cols].std() * np.sqrt(kf[cols].notna().sum())},
+                                       "t값 (자기상관 보정)": kf[cols].apply(lambda c: hac_tstat(c.values))},
                                       ).rename(index=uv.KR_FACTORS)
-                    st.dataframe(yr.style.format({"연 평균": "{:+.1%}", "연 변동성": "{:.1%}", "t값": _signed(1)}, na_rep="—"),
+                    st.dataframe(yr.style.format({"연 평균": "{:+.1%}", "연 변동성": "{:.1%}", "t값 (자기상관 보정)": _signed(1)}, na_rep="—"),
                                  width="stretch")
                     st.caption("같은 종목 범위(그때의 거래대금 상위 200)에서 21거래일마다 줄 세워 상위 30% − 하위 30%(동일 비중)를 들고 간 수익률입니다. "
                                "시장은 시가총액 가중 − CD 91일 금리, 소형주는 시가총액 하위 − 상위, 가치는 장부가/시총, 수익성은 ROE(DART 재무제표, "
@@ -804,12 +849,18 @@ with tab_pick:
                 cov = pd.Series({uv.FEATURES[c][0]: U["coverage"].get(c, 0) for c in uv.FEATURES})
                 st.markdown("**신호별 데이터 보유율** (30% 미만이면 모델에서 제외)")
                 st.dataframe(cov.to_frame("보유율").style.format("{:.0%}"), width="stretch")
-                st.markdown("""
-- **종목 범위:** 현재 상장된 코스피 보통주 전체 중, 각 과거 시점의 거래대금 상위 200개 (공식 코스피200 구성과는 다름).
+                if U.get("krx"):
+                    scope = (f"""- **종목 범위:** KRX 일별매매정보의 **그날 상장돼 있던** 코스피 보통주 전체(그 사이 상장폐지된 {U.get('n_delisted', 0)}종목 포함) 중,
+  각 과거 시점의 거래대금 상위 200개 (공식 코스피200 구성과는 다름). 폐지 종목은 정리매매 마지막 가격까지의 손익을 반영하고 그 뒤는 현금으로 봅니다.
+- **가치 지표:** DART 재무제표(분기·사업보고서)의 자본총계·순이익을 **공시 다음 거래일부터**, 시가총액은 **그날의 실제 값**(KRX)으로 씁니다.
+  폐지 종목은 수급·실적·재무 데이터가 없어 그 신호는 중간값으로 둡니다.""")
+                else:
+                    scope = """- **종목 범위:** 현재 상장된 코스피 보통주 전체 중, 각 과거 시점의 거래대금 상위 200개 (공식 코스피200 구성과는 다름).
   '지금 큰 종목'으로 과거를 고르는 편향은 없앴지만, 그 사이 **상장폐지된 종목은 주가가 없어 빠져 있어**
-  과거 성과가 약간 좋게 보일 수 있습니다.
+  과거 성과가 약간 좋게 보일 수 있습니다 (KRX 일별매매정보를 받으면 포함).
 - **가치 지표:** DART 재무제표(분기·사업보고서)의 자본총계·순이익을 **공시 다음 거래일부터** 씁니다.
-  시가총액은 '그날 주가 × 현재 상장주식수'로 근사해서, 과거 증자·소각으로 주식수가 바뀐 종목은 오차가 있습니다.
+  시가총액은 '그날 주가 × 현재 상장주식수'로 근사해서, 과거 증자·소각으로 주식수가 바뀐 종목은 오차가 있습니다."""
+                st.markdown(scope + """
 - **비용:** 리밸런싱마다 바뀐 종목 비율 × (살 때·팔 때 수수료·체결 비용)을 빼고, 증권거래세를 켜면 판 비중 × 그날의 코스피 세율을
   더 뺍니다. 호가 차이·시장 충격이 설정보다 크면 결과가 나빠집니다.
 - 투자 조언이 아닙니다.
@@ -1084,11 +1135,17 @@ with tab4:
             vt = run_var_backtest(rets.values, vol_model)
             vshow = vt.assign(판정=np.where(vt["종합 p값"].astype(float) > 0.05, "통과", "기각"))
             st.dataframe(vshow.style.format({"관측일": "{:.0f}", "예외 횟수": "{:.0f}", "예외 비율": "{:.1%}", "목표 비율": "{:.0%}",
-                                             "Kupiec p값": "{:.2f}", "Christoffersen p값": "{:.2f}", "종합 p값": "{:.2f}"}),
+                                             "Kupiec p값": "{:.2f}", "Christoffersen p값": "{:.2f}", "종합 p값": "{:.2f}",
+                                             "예외일 손실 ÷ 예측 ES": "{:.2f}", "ES 검정 p값": "{:.2f}",
+                                             "분위수 손실(×10⁴)": "{:.2f}", "재적합 수": "{:.0f}", "추정 실패": "{:.0f}"}, na_rep="—"),
                          width="stretch", column_config={"판정": st.column_config.TextColumn("판정", alignment="center")})
             st.caption("Kupiec: 예외 비율이 목표(5%·1%)와 같은지. Christoffersen: 예외가 특정 시기에 몰려 나오지 않는지 "
                        "(몰리면 변동성 변화를 늦게 따라간다는 뜻). p값이 0.05보다 작으면 그 VaR를 기각합니다. "
-                       "하루 단위라 위의 기간 VaR와 달리 표본이 겹치지 않습니다.")
+                       "하루 단위라 위의 기간 VaR와 달리 표본이 겹치지 않습니다. "
+                       "예외일 손실 ÷ 예측 ES는 1에 가까워야 하고, 크면(ES 검정 p값 < 0.05) 꼬리 손실의 크기를 작게 잡은 것입니다. "
+                       "분위수 손실은 모델끼리 비교할 때 쓰며 낮을수록 좋습니다. "
+                       "최근 약 500일이라 99% VaR는 예외가 5번 정도뿐이어서, 통과해도 극단 손실을 맞힌다는 증거로는 약합니다 — "
+                       "첫 3년 뒤 전체 기간으로 검정한 결과는 실제 데이터 검증 보고서(validation/README.md)에 있습니다.")
 
 st.caption(f"재현 정보 — 코드 {repro.code_version()} · 주가 데이터 {repro.fingerprint(close)}"
            + (f" · 방향 예측 데이터 {repro.fingerprint(close_long)}" if p_up is not None else "")

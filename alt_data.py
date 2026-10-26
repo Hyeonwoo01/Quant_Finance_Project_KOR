@@ -186,9 +186,14 @@ def build_alt_features(ticker, index):
             df = None
             status[name] = f"오류: {e}"[:80]
         if df is not None and df.notna().any().any():
+            first = df.loc[:, df.notna().any()].dropna().index.min()
+            # 방향 모델은 모든 특징이 있는 날만 쓰므로, 가격 기록의 뒤쪽 절반에서야 시작하는 데이터를 넣으면
+            # 학습·검증 기간이 절반 넘게 줄어든다 (2년 학습 최소치보다 짧아져 아예 계산이 안 되기도 함) → 빼고 학습
+            if first is pd.NaT or first > index[len(index) // 2]:
+                status[name] = f"기간이 짧아 제외 ({first.date() if first is not pd.NaT else '?'} 부터)"
+                continue
             parts.append(df)
-            first = df.dropna().index.min()
-            status[name] = f"사용 ({first.date() if first is not pd.NaT else '?'} 부터)"
+            status[name] = f"사용 ({first.date()} 부터)"
         elif name not in status:
             status[name] = "데이터 없음"
     return (pd.concat(parts, axis=1) if parts else None), status

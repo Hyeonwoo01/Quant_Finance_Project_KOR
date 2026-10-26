@@ -88,6 +88,20 @@ for _lag in (0, 1):
     assert np.allclose(np.diff(np.log(_e["equity"]["전략"].values)),
                        (_pos * _r.shift(-(1 + _lag)).reindex(wf_a.index).fillna(0.0)).values[1:])
     assert _e["z"] == ev["z"] and _e["skill"] == ev["skill"]          # 예측 채점은 체결 시점과 무관
+# 확률 구간 표: 오를 확률이 높아도 내릴 때 크게 잃으면 평균 수익은 음수 — 확률과 크기를 함께 보여야 한다
+_bt = dr.bucket_table(pd.Series([0.3, 0.3, 0.7, 0.7]), pd.Series(np.log([1.1, 0.9, 1.02, 0.8])), cost=0.005)
+assert list(_bt["관측 수"]) == [2, 0, 0, 0, 0, 2] and np.isclose(_bt.loc["60%~100%", "평균 수익"], -0.09)
+assert np.isclose(_bt.loc["60%~100%", "오를 때 평균"], 0.02) and np.isclose(_bt.loc["60%~100%", "내릴 때 평균"], -0.2)
+assert np.isclose(_bt.loc["0%~40%", "비용 뺀 평균"], -0.005) and _bt.loc["0%~40%", "실제 상승 비율"] == 0.5
+# 21일 분할 보유(hold=21): 매일 판단한 1/21 몫이 체결(t+1 종가) 뒤 정확히 21거래일의 수익을 번다
+# → 비용 0이면 전략 수익 합 = Σ 신호 × (t+1 종가 → t+22 종가 로그수익률) / 21 (끝에서 아직 안 끝난 몫은 거기까지만)
+_eh = dr.evaluate(wf_a, 21, _r, lag=1, hold=21)
+_sig, _nx = _pos.values, _r.shift(-2).reindex(wf_a.index).fillna(0.0).values
+assert np.isclose(_eh["daily"]["strat"].sum(), sum(_sig[t] / 21 * _nx[t:t + 21].sum() for t in range(len(_sig))))
+assert 0 < _eh["time_in_market"] < 1 and _eh["z"] == ev["z"]
+_ehc = dr.evaluate(wf_a, 21, _r, 10.0, lag=1, hold=21)
+assert np.isclose(_ehc["daily"]["strat"].sum(), _eh["daily"]["strat"].sum()
+                  - 10e-4 * (_eh["daily"]["pos"].diff().abs().sum() + _eh["daily"]["pos"].iloc[0]))   # 비용은 상쇄된 순매매에만
 
 # 겹침 보정 t값: 겹침이 없으면(h=1) 보통 t값과 같고, 21일씩 겹친 합이면 크게 줄어야 한다
 from quant_engine import overlap_tstat
@@ -101,6 +115,27 @@ assert overlap_tstat(np.zeros(100), 5) == 0.0
 _rej = np.mean([abs(overlap_tstat(np.convolve(_g.standard_normal(2520), np.ones(21), "valid")[:2500], 21)) > 1.96
                 for _ in range(1000)])
 assert 0.025 < _rej < 0.08, _rej
+
+
+def _garch_t(T, R, g):
+    """실제 수익률에 가까운 합성 일간 수익률 R개 (T일): GARCH(1,1) 변동성 군집 + t(5) 두꺼운 꼬리, 평균 0."""
+    z = g.standard_t(5, size=(T + 300, R)) / np.sqrt(5 / 3)
+    out, s2 = np.empty((T + 300, R)), np.full(R, 1e-4)
+    for t in range(T + 300):
+        out[t] = np.sqrt(s2) * z[t]
+        s2 = 2e-6 + 0.08 * out[t] ** 2 + 0.9 * s2
+    return out[300:]
+
+
+# 같은 검정을 실제와 비슷한 조건에서: '63일 모멘텀이 양수면 오른다'(예측력 없음)를 21일 결과로 채점한 적중 차이.
+# 진짜 차이는 0인데 '유의'가 나오는 비율이 5% 근처여야 하고, 겹침을 무시한 보통 t값은 크게 과대평가해야 한다
+_nd, _R = 1700, 500
+_cg = np.vstack([np.zeros(_R), np.cumsum(_garch_t(_nd + 85, _R, np.random.default_rng(7)), 0)])
+_up = (_cg[63 + 21:63 + 21 + _nd] - _cg[63:63 + _nd] > 0).astype(float)
+_d = ((_cg[63:63 + _nd] - _cg[:_nd] > 0) == _up).astype(float) - _up
+_rej_hh = np.mean([abs(overlap_tstat(_d[:, i], 21)) > 1.96 for i in range(_R)])
+_rej_naive = np.mean([abs(_d[:, i].mean() / _d[:, i].std() * np.sqrt(_nd)) > 1.96 for i in range(_R)])
+assert 0.025 < _rej_hh < 0.10 and _rej_naive > 0.4, (_rej_hh, _rej_naive)
 
 # 파이프라인이 '실제로 예측 가능한' 데이터에선 신호를 찾아내는지 (모멘텀이 있는 합성 가격)
 r = np.zeros(2500)
@@ -123,6 +158,23 @@ assert ad.headline_score("Apple beats estimates, shares surge") > 0
 assert ad.headline_score("Stock plunges after earnings miss") < 0
 assert ad.headline_score("삼성전자 호실적에 신고가") > 0 and ad.headline_score("반도체 부진 우려에 급락") < 0
 assert ad.headline_score("Company holds annual meeting") == 0
+
+# 가격 기록의 뒤쪽 절반에서야 시작하는 대체 데이터는 뺀다 (모든 특징이 있는 날만 쓰므로 넣으면 학습 기간이 절반 넘게 줄어듦).
+# 끝까지 비어 있는 열(이 종목엔 해당 없음)은 시작 시점 판단에서 무시
+_ix = pd.bdate_range("2016-01-01", periods=2500)
+_saved_src = {k: getattr(ad, k) for k in ("earnings_features", "analyst_features", "flow_features")}
+try:
+    ad.earnings_features = lambda t, i: pd.DataFrame({"pead": np.where(np.arange(len(i)) >= 2000, 1.0, np.nan)}, index=i)
+    ad.analyst_features = lambda t, i: None
+    ad.flow_features = lambda t, i: pd.DataFrame({"frgn_flow_21": np.where(np.arange(len(i)) >= 300, 1.0, np.nan),
+                                                  "frgn_hold_chg": np.nan}, index=i)
+    _alt_s, _st = ad.build_alt_features("SPY", _ix)
+    assert list(_alt_s.columns) == ["frgn_flow_21", "frgn_hold_chg"], _alt_s.columns
+    assert _st["실적 서프라이즈"].startswith("기간이 짧아 제외") and _st["외국인·기관 수급"].startswith("사용")
+    assert _st["애널리스트 변경"] == "데이터 없음"
+finally:
+    for _k, _v in _saved_src.items():
+        setattr(ad, _k, _v)
 
 # alt 특징을 넣어도 워크포워드에 미래 정보가 새지 않는지 (T 이후 alt 값만 바꿔 봄)
 alt_a = pd.DataFrame({"eps_surprise": rng.normal(0, 0.1, len(px))}, index=px.index)
@@ -206,11 +258,45 @@ def synth_panel(seed, n_stock=80, n_day=800, shock_after=None):
     return {"feat": F, "close": close, "universe": univ, "names": pd.Series(codes, index=codes),
             "coverage": {"mom_12_1": 1.0, "frgn_flow_21": 1.0}}
 
+# 정답 순위: 미래 수익률이 없는 종목은 중간값(0)이 아니라 NaN → 학습에서 빠짐 (특징 순위는 결측 = 중간값 그대로)
+_fw = pd.DataFrame([[0.1, np.nan, -0.1, 0.0]], columns=list("abcd"), index=[pd.Timestamp("2024-01-02")])
+_uv = pd.DataFrame([[True, True, True, False]], columns=list("abcd"), index=_fw.index)
+_tr = uv.target_rank(_fw, _uv).iloc[0]
+assert np.allclose(_tr[["a", "c"]].values, [0.5, 0.0]) and np.isnan(_tr["b"]) and np.isnan(_tr["d"])   # a·c 둘 중 순위
+assert uv.cross_rank(_fw, _uv).iloc[0]["b"] == 0.0
+
 pa = synth_panel(5)
 wf_u = uv.walk_forward(pa, h=21, train_years=1, refit_models=("ridge",))
 tab, _ = uv.evaluate(wf_u, cost_bps=0)
 assert tab.loc["ridge", "평균 IC"] > 0.1 and tab.loc["ridge", "상위20% 초과수익(연, 비용후)"] > 0, tab
 assert tab.loc["composite", "평균 IC"] > 0.05            # 고정 가중도 (외국인 수급 + 방향) 신호를 반영
+# 비용 민감도: 비용이 늘면 초과수익이 줄고, 손익분기 비용에서 정확히 0 (비용은 초과수익에 선형)
+_cs, _be = uv.cost_sensitivity(wf_u)
+assert _cs["초과수익(연, 비용후)"].is_monotonic_decreasing and _be > 0
+assert abs(uv.evaluate(wf_u, _be, models=["auto"])[0].loc["auto", "상위20% 초과수익(연, 비용후)"]) < 1e-9
+# 시장 구간별: 기간을 범위 평균 수익률 3분위로 나눔 (모든 기간이 한 번씩)
+_mb = uv.market_breakdown(uv.evaluate(wf_u, 5)[1])
+assert list(_mb.index) == ["하락", "횡보", "상승"] and _mb["기간 수"].sum() == tab.loc["auto", "리밸런싱 수"]
+assert _mb["시장 평균(기간)"].is_monotonic_increasing
+# 위험 반영 비중: 변동성 역수에 비례, 종목당 동일 비중의 2배 상한, 합 1. 변동성 자료가 없으면 동일 비중
+_wv = {"vol": pd.DataFrame([[0.01, 0.02, 0.04, 0.08]], columns=list("abcd"), index=[0])}
+_ww = uv._weights(list("abcd"), 0, _wv, "inv_vol")
+assert np.isclose(_ww.sum(), 1) and _ww.max() <= 0.5 + 1e-12 and list(_ww.sort_values(ascending=False).index) == list("abcd")
+assert np.allclose(uv._weights(list("abcd"), 0, {"vol": None}, "inv_vol"), 0.25)
+_wfv = dict(wf_u)
+_wfv["vol"] = pd.DataFrame(np.random.default_rng(0).uniform(0.01, 0.04, (len(wf_u["rebal"]), 80)),
+                           index=wf_u["rebal"], columns=wf_u["universe"].columns)
+assert uv.evaluate(_wfv, 5, weighting="inv_vol", models=["auto"])[0].shape[0] == 1
+assert np.isclose(uv.evaluate(wf_u, 5, weighting="inv_vol")[0].loc["auto", "상위20% 초과수익(연, 비용후)"],   # 변동성 자료 없음
+                  uv.evaluate(wf_u, 5)[0].loc["auto", "상위20% 초과수익(연, 비용후)"])                          # → 동일 비중과 같음
+# 기준 전략(저변동성 단일 등)은 같은 조건으로 표에 나오지만 자동 선택 후보는 아니다
+_pv = synth_panel(6)
+_pv["feat"]["vol_63"] = pd.DataFrame(np.random.default_rng(7).uniform(0.01, 0.04, _pv["close"].shape),
+                                     index=_pv["close"].index, columns=_pv["close"].columns)
+_pv["coverage"]["vol_63"] = 1.0
+_wfb = uv.walk_forward(_pv, h=21, train_years=1, refit_models=("ridge",))
+assert "lowvol" in _wfb["scores"] and "value" not in _wfb["scores"] and not _wfb["chosen"].isin(list(uv.BASELINES)).any()
+assert "lowvol" in uv.evaluate(_wfb, 5)[0].index
 Tcut = 700                                                # 첫 리밸런싱(512일) 이후 리밸런싱 9회가 비교됨
 pb = synth_panel(5, shock_after=Tcut)
 wf_b = uv.walk_forward(pb, h=21, train_years=1, refit_models=("ridge",))
@@ -225,7 +311,15 @@ _cl, _d0 = pa["close"], wf_u["rebal"][3]
 _i0 = _cl.index.get_loc(_d0)
 assert np.allclose(wf_u0["fwd"].loc[_d0], np.log(_cl.iloc[_i0 + 21] / _cl.iloc[_i0]))
 assert np.allclose(wf_u["fwd"].loc[_d0], np.log(_cl.iloc[_i0 + 22] / _cl.iloc[_i0 + 1]))
-assert wf_u["exec_lag"] == 1 and np.allclose(wf_u["scores"]["ridge"].values, wf_u0["scores"]["ridge"].values, equal_nan=True)
+assert wf_u["exec_lag"] == 1 and np.allclose(wf_u["scores"]["composite"].values, wf_u0["scores"]["composite"].values, equal_nan=True)
+# 학습 목표도 체결 이후 h일 수익률이라 학습 모델 점수는 체결 시점에 따라 달라진다. 그만큼 학습 데이터는 하루 더 일찍 끊겨야 한다:
+# 리밸런싱 날 d 바로 다음 날부터 가격을 바꿔도 d의 점수는 그대로 (끊는 시점이 t−h면 목표가 d+1 종가를 써서 달라짐)
+_rdc = wf_u["rebal"][-3]
+_pc = synth_panel(5, shock_after=pa["close"].index.get_loc(_rdc))
+_wfc = uv.walk_forward(_pc, h=21, train_years=1, refit_models=("ridge",), sample_every=1)      # 모든 날로 학습 (경계 날 포함)
+_wfa = uv.walk_forward(pa, h=21, train_years=1, refit_models=("ridge",), sample_every=1)
+assert np.allclose(_wfc["scores"]["ridge"].loc[_rdc].values, _wfa["scores"]["ridge"].loc[_rdc].values, equal_nan=True)
+assert not np.allclose(wf_u["scores"]["ridge"].values, wf_u0["scores"]["ridge"].values, equal_nan=True)
 
 # 거시 지표 시차: 명시 > 티커로 자동 판단 > 모르면 안전하게 하루 늦춤
 assert dr.resolve_lag(None, "005930.KS") and dr.resolve_lag(None, "247540.KQ")
@@ -281,6 +375,20 @@ assert abs(v["bm"].loc["2024-03-18", "000010"] - 1.20) < 1e-12
 assert abs(v["ep"].loc["2024-05-16", "000010"] - 0.45) < 1e-12         # 10+10+20+5 = 45
 assert abs(v["roe"].loc["2024-05-16", "000010"] - 45 / 125) < 1e-12
 assert v["bm"].loc["2023-05-15", "000010"] != v["bm"].loc["2023-05-15", "000010"]   # 첫 공시 전엔 NaN
+# 그날의 실제 시가총액(KRX)이 있으면 그 값으로: 2024-04부터 증자로 시총이 두 배 → 그 뒤 B/M은 절반 (현재 주식수 근사로는 못 잡음)
+_mc = pd.DataFrame({"000010": np.where(vidx >= pd.Timestamp("2024-04-01"), 200.0, 100.0)}, index=vidx)
+v2 = kr_data.value_features(fin, vidx, vclose, pd.Series(dtype=float), mcap=_mc)
+assert abs(v2["bm"].loc["2024-03-18", "000010"] - 1.20) < 1e-12 and abs(v2["bm"].loc["2024-04-02", "000010"] - 0.60) < 1e-12
+
+# KRX Open API 일별매매정보 해석: 쉼표·'-' 정리, 12자리 표준코드 → 6자리
+_kr = kr_data.parse_krx_daily([
+    {"BAS_DD": "20261023", "ISU_CD": "005930", "ISU_NM": "삼성전자", "TDD_CLSPRC": "71,200", "FLUC_RT": "-1.25",
+     "ACC_TRDVOL": "1,234", "ACC_TRDVAL": "87,860,800", "MKTCAP": "425,000,000,000,000", "LIST_SHRS": "5,969,782,550"},
+    {"BAS_DD": "20261023", "ISU_CD": "KR7000660001", "ISU_NM": "SK하이닉스", "TDD_CLSPRC": "-", "FLUC_RT": "",
+     "ACC_TRDVOL": "0", "ACC_TRDVAL": "0", "MKTCAP": "1", "LIST_SHRS": "2"}])
+assert _kr["code"].tolist() == ["005930", "000660"] and _kr.loc[0, "close"] == 71200 and _kr.loc[0, "chg_pct"] == -1.25
+assert _kr.loc[0, "cap"] == 4.25e14 and _kr.loc[0, "shares"] == 5969782550 and np.isnan(_kr.loc[1, "close"])
+assert kr_data.parse_krx_daily([]).empty
 
 # ---------------- t분포 GARCH · 위험 지표 ----------------
 from quant_engine import GammaScalpingEngine as _GSE, max_drawdown, summarize_vol_backtest, var_es, vol_signal_backtest
@@ -297,6 +405,8 @@ def simulate_garch_t(n, omega, alpha, beta, nu, rng):
 
 gt = GarchVolForecaster().fit(simulate_garch_t(6000, 4e-6, 0.08, 0.90, 5.0, np.random.default_rng(11)))
 assert 3.5 < gt.nu < 7.5 and abs(gt.persistence - 0.98) < 0.03, (gt.nu, gt.persistence)
+# 시작값 셋 모두에서 최적화해 가장 좋은 해를 쓰고, 진단을 남긴다 (모두 수렴, 같은 답이면 우도 차이 ≈ 0)
+assert gt.fit_info["시작값"] == 3 and gt.fit_info["수렴"] == 3 and 0 <= gt.fit_info["우도 차이"] < 0.01 and gt.fit_info["경계"] == []
 assert GarchVolForecaster(dist="normal").fit(simulate_garch(3000, 4e-6, 0.08, 0.90, np.random.default_rng(3))).nu == np.inf
 sim = gt.simulate(21, 20000, seed=1)
 assert sim.shape == (20000, 21)
@@ -335,6 +445,21 @@ assert var_exception_tests(np.zeros(250, bool), 0.05)["Kupiec p값"] < 0.01
 _vt = var_backtest(simulate_garch_t(1500, 4e-6, 0.08, 0.90, 5.0, np.random.default_rng(12)))
 assert list(_vt.index) == ["하루 VaR 95%", "하루 VaR 99%"] and _vt.loc["하루 VaR 95%", "관측일"] == 500
 assert 0.02 < _vt.loc["하루 VaR 95%", "예외 비율"] < 0.09
+# ES: t분포 충격의 꼬리 평균 공식이 시뮬레이션과 같고, 맞는 모델이면 '예외일 손실 ÷ 예측 ES' ≈ 1,
+# 꼬리를 얇게 잡은 모델(정규분포)이면 1보다 크고 ES 검정이 기각, 분위수 손실도 더 크다
+from quant_engine import _std_es, es_exceedance_test
+_zt = np.random.default_rng(2).standard_t(5, 1_000_000) * np.sqrt(3 / 5)
+assert abs(-_zt[_zt <= np.quantile(_zt, 0.01)].mean() / _std_es(0.01, 5.0) - 1) < 0.01
+assert abs(_std_es(0.05, np.inf) - 2.0627) < 1e-3
+_xv = simulate_garch_t(2300, 4e-6, 0.08, 0.90, 4.0, np.random.default_rng(14))
+_vt_t, _vd_t = var_backtest(_xv, start=800, refit_every=42, detail=True)
+_vt_n = var_backtest(_xv, start=800, refit_every=42, dist="normal")
+assert _vt_t.loc["하루 VaR 95%", "관측일"] == 1500 and len(_vd_t) == 1500 and _vt_t["추정 실패"].iloc[0] == 0
+assert 0.85 < _vt_t.loc["하루 VaR 95%", "예외일 손실 ÷ 예측 ES"] < 1.15 and _vt_t.loc["하루 VaR 95%", "ES 검정 p값"] > 0.05
+assert _vt_n.loc["하루 VaR 99%", "예외일 손실 ÷ 예측 ES"] > 1.15 and _vt_n.loc["하루 VaR 95%", "ES 검정 p값"] < 0.01
+assert _vt_n.loc["하루 VaR 99%", "분위수 손실(×10⁴)"] > _vt_t.loc["하루 VaR 99%", "분위수 손실(×10⁴)"]
+assert (_vd_t["예외 95%"] == (_vd_t["수익률"] < -_vd_t["VaR 95%"])).all() and (_vd_t["ES 99%"] > _vd_t["VaR 99%"]).all()
+assert np.isnan(es_exceedance_test([0.03, 0.04], [0.02, 0.02], [0.01, 0.01])[1])          # 예외 3번 미만 → p값 없음
 
 v95, es95 = var_es(np.random.default_rng(0).normal(0, 0.01, 400000), 0.95)
 assert abs(v95 - (1 - np.exp(-1.645 * 0.01))) < 3e-4 and es95 > v95
@@ -505,6 +630,17 @@ for _ in range(300):
 assert _hd / 300 < 0.06 and _hp / 300 > 0.3, (_hd, _hp)
 assert deflated_sharpe(0.3 + _g.standard_normal(500), [0.3, 0.0, 0.05])["dsr"] > 0.99      # 진짜 효과는 살아남음
 assert deflated_sharpe(np.zeros(50), [0.1]) is None
+# 자기상관이 있으면 샤프가 더 흔들린다 → 표본 길이를 줄여 센다. 평균 0, 자기상관 0.4인 전략 하나를 그대로 믿으면
+# '진짜일 확률 > 97.5%'가 목표 2.5% 대신 약 10% 나오는데, 보정하면 약 4%. 음의 자기상관으로 표본을 늘리지는 않음
+_ea4 = _g.standard_normal((300, 550))
+_x4 = np.zeros_like(_ea4)
+for _t in range(1, 550):
+    _x4[:, _t] = 0.4 * _x4[:, _t - 1] + _ea4[:, _t]
+_x4 = _x4[:, 50:]
+_d4 = [deflated_sharpe(_x4[i], [_x4[i].mean() / _x4[i].std(ddof=1)]) for i in range(300)]
+assert np.mean([d["dsr"] > 0.975 for d in _d4]) < 0.06 and np.mean([d["T_eff"] / d["T"] for d in _d4]) < 0.6
+assert all(d["T_eff"] < 0.9 * d["T"] for d in _d4)
+assert deflated_sharpe(_x4[0] * (-1) ** np.arange(500), [0.0, 0.1])["T_eff"] == 500
 # French 데이터 형식 (설명 줄, %, -99.99 결측, 뒤쪽 저작권 줄)
 _ff = md.parse_french_csv("설명\n\n,Mkt-RF,SMB,RF\n20240102,  1.50, -99.99, 0.02\n20240103, -0.50, 0.10, 0.02\n\nCopyright\n")
 assert list(_ff.columns) == ["Mkt-RF", "SMB", "RF"] and _ff.loc["2024-01-02", "Mkt-RF"] == 0.015
@@ -555,7 +691,7 @@ assert isinstance(repro.code_version(), str) and repro.fingerprint(_s1.iloc[:0])
 _pc = synth_panel(5)
 _pc["feat"]["liq"] = pd.DataFrame(np.log(1e11), index=_pc["close"].index, columns=_pc["close"].columns)   # 하루 거래대금 1,000억 원
 _tq, _cq = uv.evaluate(wf_u, cost_bps=0)
-_hold = uv._holdings(wf_u, "auto")
+_hold, _ = uv._holdings(wf_u, "auto")
 _gross = pd.Series({d: (np.exp(wf_u["fwd"].loc[d, c]) - 1).mean() for d, c in _hold.items()})
 _curve = _cq["auto"]["상위 20% (비용 후)"]
 assert np.allclose((_curve / _curve.shift(1).fillna(1.0) - 1).values, _gross.values)      # evaluate와 같은 보유 종목
@@ -670,6 +806,61 @@ _t1, _c1 = uv.evaluate(wf_u, cost_bps=0, sell_tax=True)
 _n0 = _c0["auto"]["상위 20% (비용 후)"]; _n1 = _c1["auto"]["상위 20% (비용 후)"]
 assert _n0.iloc[0] == _n1.iloc[0] and (_n1.iloc[1:] < _n0.iloc[1:]).all()
 
+# ---------------- 가격제한폭·거래정지: 체결할 수 없는 주문 ----------------
+assert kc.limit_rate(["2015-06-12", "2015-06-15", "2026-01-02"]).tolist() == [0.15, 0.30, 0.30]
+_dl = pd.bdate_range("2026-03-02", periods=6)
+_mv = pd.Series([0.01, 0.02, -0.298, 0.02, 0.297, 0.0], index=_dl)
+_dn, _upl = kc.limit_hits(_mv)
+assert _dn.tolist() == [False, False, True, False, False, False] and _upl.tolist() == [False, False, False, False, True, False]
+# 판단일 t의 주문은 t+1 종가에 체결: 체결일이 하한가면 팔기(1→0)가, 상한가면 사기(0→1)가 하루 미뤄진다
+_tg = pd.Series([1.0, 0.0, 0.0, 0.0, 1.0, 1.0], index=_dl)
+assert kc.apply_price_limits(_tg, np.log1p(_mv), lag=1).tolist() == [1.0, 1.0, 0.0, 0.0, 1.0, 1.0]   # 3/3 판단 → 3/4 하한가 → 3/5에 팜
+_tg2 = pd.Series([0.0, 0.0, 0.0, 1.0, 1.0, 1.0], index=_dl)
+assert kc.apply_price_limits(_tg2, np.log1p(_mv), lag=1).tolist() == [0.0, 0.0, 0.0, 0.0, 1.0, 1.0]  # 3/5 판단 → 3/6 상한가 → 3/9에 삼
+assert kc.apply_price_limits(_tg, np.log1p(_mv * 0), lag=1).equals(_tg)                              # 제한폭 없으면 그대로
+# 방향 전략: 제한폭에 걸린 날이 없으면 결과가 같고, 하한가 날엔 팔지 못한 손실까지 떠안는다
+_rpx = np.log(px).diff()
+assert np.allclose(dr.evaluate(wf_a, 21, _rpx)["daily"]["strat"], dr.evaluate(wf_a, 21, _rpx, price_limit=False)["daily"]["strat"])
+# 종목 고르기: 하한가·거래정지면 못 팔아 계속 보유, 상한가·거래정지면 못 삼 (막힌 주문 수를 표에 남김)
+_wf_blk = dict(wf_u)
+_wf_blk["blocked"] = {"sell": pd.DataFrame(True, index=wf_u["rebal"], columns=wf_u["universe"].columns),
+                      "buy": pd.DataFrame(False, index=wf_u["rebal"], columns=wf_u["universe"].columns)}
+_tb, _ = uv.evaluate(_wf_blk, cost_bps=0)
+_tb0, _ = uv.evaluate(wf_u, cost_bps=0)
+assert _tb.loc["ridge", "체결 막힌 주문"] > 0 and _tb.loc["ridge", "평균 회전율"] < _tb0.loc["ridge", "평균 회전율"]
+assert _tb0.loc["ridge", "체결 막힌 주문"] == 0                                                   # 원래 주가가 없는 합성 패널 = 제약 없음
+# 손으로 만든 3번의 리밸런싱 (30종목, 상위 6개, 매번 겹치지 않게 고름): 수익은 종목 번호 × 0.1%로 정해 둠
+_dz = pd.bdate_range("2024-01-01", periods=3)
+_cz = [f"{i:06d}" for i in range(30)]
+_sz = pd.DataFrame([[(i - 6 * k) % 30 * -1.0 for i in range(30)] for k in range(3)], index=_dz, columns=_cz)  # k번째: 6k~6k+5가 1등
+_wz = {"h": 21, "rebal": list(_dz), "universe": pd.DataFrame(True, index=_dz, columns=_cz), "exec_lag": 1,
+       "fwd": pd.DataFrame([[np.log1p(0.001 * i) for i in range(30)]] * 3, index=_dz, columns=_cz),
+       "scores": {"ridge": _sz}, "ic": {"ridge": pd.Series(0.1, index=_dz)}}
+_no = pd.DataFrame(False, index=_dz, columns=_cz)
+_ret = lambda names: np.mean([0.001 * int(c) for c in names])
+_wz["blocked"] = {"sell": _no, "buy": _no}                                                  # 제약 없음 → 매번 그 6개
+_tz, _cz0 = uv.evaluate(_wz, cost_bps=0)
+assert np.allclose(_cz0["ridge"]["상위 20% (비용 후)"].values, np.cumprod([1 + _ret(_cz[6 * k:6 * k + 6]) for k in range(3)]))
+_wz["blocked"] = {"sell": _no, "buy": ~_no}                                                 # 아무것도 못 삼 → 현금
+_tz, _cz1 = uv.evaluate(_wz, cost_bps=0)
+assert np.allclose(_cz1["ridge"]["상위 20% (비용 후)"].values, 1.0) and _tz.loc["ridge", "체결 막힌 주문"] == 18
+_wz["blocked"] = {"sell": ~_no, "buy": _no}                                                 # 못 팜 → 산 것이 계속 쌓임
+_tz, _cz2 = uv.evaluate(_wz, cost_bps=0)
+assert np.allclose(_cz2["ridge"]["상위 20% (비용 후)"].values,
+                   np.cumprod([1 + _ret(_cz[:6]), 1 + _ret(_cz[:12]), 1 + _ret(_cz[:18])])) and _tz.loc["ridge", "체결 막힌 주문"] == 6 + 12
+# 패널에서 막힌 주문 표 만들기: 체결일 거래량 0(거래정지) → 사고팔기 모두 막힘, 하한가 → 팔기만 막힘
+_pa5 = synth_panel(5)                                 # wf_u를 만든 합성 패널 (pa는 위에서 다른 값으로 바뀜)
+_pr = dict(_pa5)
+_pr["close_raw"] = _pa5["close"].copy()
+_pr["volume"] = pd.DataFrame(1000.0, index=_pa5["close"].index, columns=_pa5["close"].columns)
+_d3 = wf_u["rebal"][3]
+_e3 = _pa5["close"].index[_pa5["close"].index.get_loc(_d3) + 1]
+_pr["volume"].loc[_e3, "000001"] = 0.0
+_pr["close_raw"].loc[_e3:, "000002"] *= 0.70 / (_pr["close_raw"].loc[_e3, "000002"] / _pr["close_raw"].shift(1).loc[_e3, "000002"])
+_bo = uv._blocked_orders(_pr, wf_u["rebal"], 1)
+assert _bo["sell"].at[_d3, "000001"] and _bo["buy"].at[_d3, "000001"]
+assert _bo["sell"].at[_d3, "000002"] and not _bo["buy"].at[_d3, "000002"] and not _bo["sell"].at[_d3, "000003"]
+
 # ---------------- 종목 고르기: 매주 미리 계산(GitHub Actions) + 추천 실전 기록 ----------------
 import tempfile
 _res = uv.results(_pc, wf_u, cost_bps=5.0, sell_tax=True)
@@ -713,6 +904,13 @@ with tempfile.TemporaryDirectory() as _td:
     assert len(uv.read_picks(Path(_td) / "picks.csv")) == 1
     _kfw = uv.load_kr_factors(Path(_td) / "kr_factors.csv")              # 매주 계산이 한국판 요인도 저장
     assert list(_kfw.columns) == ["Mkt-RF", "Mom", "RF"] and _kfw.index[-1] == _cw.index[-1]   # 시총·재무가 없는 패널
+    # 결과 묶음: 비용 민감도·손익분기, 시장 구간별, 위험 반영 비중, 자동 선택이 바뀐 횟수 → 검증 보고서 요약까지
+    _U = _wres[(63, 1, True)]
+    assert _U["cost_sens"][0].shape[0] == 5 and _U["switches"] >= 0 and _U["risk_weighted"] is not None
+    import validation as _vdr
+    _rk = _vdr.ranking_summary(_td)
+    _mdr = _vdr.report_markdown([], _rk, "2026-10-26", "test")
+    assert "손익분기 비용" in _mdr and "자동 선택이 바뀐 횟수" in _mdr and "기준 전략" in _mdr
 
 # ---------------- 한국판 요인 (파마-프렌치 방식의 근사) ----------------
 # 심어 둔 구조: 시가총액이 작을수록, 장부가/시총이 클수록 매일 조금 더 오른다 → 소형주·가치 요인이 양(+)으로 나와야
@@ -764,6 +962,18 @@ _c1 = kc.trade_cost(_ps, 0.0, _tx, lag=1)                              # 다음 
 assert np.isclose(_c0.loc["2025-12-31"], 0.0015) and np.isclose(_c1.loc["2025-12-31"], 0.0020)
 assert np.isclose(_c1.sum(), 0.0020) and kc.trade_cost(_ps, 0.0, 0.002, lag=1).sum() == 0.002      # 숫자 세율은 그대로
 
+# ---------------- 자기상관 보정 t값 (Newey-West) ----------------
+_gh = np.random.default_rng(4)
+_xi = 0.03 + _gh.standard_normal(5000)
+assert abs(qe.hac_tstat(_xi) / (_xi.mean() / _xi.std() * np.sqrt(5000)) - 1) < 0.05          # 독립이면 보통 t값과 거의 같음
+_ea = _gh.standard_normal(2050)
+_xa = np.zeros(2050)
+for _t in range(1, 2050):
+    _xa[_t] = 0.5 * _xa[_t - 1] + _ea[_t]
+_xa = _xa[50:] + 0.05
+assert 1.3 < (_xa.mean() / _xa.std() * np.sqrt(2000)) / qe.hac_tstat(_xa) < 1.9      # 자기상관 0.5 → 보통 t값이 크게 부풀려짐
+assert qe.hac_lags(60) == 3 and np.isnan(qe.hac_tstat([1.0, 2.0])) and np.isnan(qe.hac_tstat(np.ones(10)))
+
 # ---------------- 블록 부트스트랩 신뢰구간 ----------------
 _gb = np.random.default_rng(0)
 _x = 0.001 + 0.01 * _gb.standard_normal(2000)
@@ -777,6 +987,36 @@ _w1 = np.subtract(*qe.block_bootstrap_ci(_ar, 1)[::-1])
 _w50 = np.subtract(*qe.block_bootstrap_ci(_ar, 50)[::-1])
 assert 2.3 < _w50 / _w1 < 3.7                     # 자기상관 0.8이면 이론상 √((1+0.8)/(1−0.8)) = 3배 넓어야
 assert np.isnan(qe.block_bootstrap_ci(_x[:50], 42)[0])                # 표본이 블록 2배보다 짧으면 계산하지 않음
+# 실제와 비슷한 조건(GARCH·t(5))에서 '63일 모멘텀이 양수면 보유, 다음 날 체결' 전략의 일간 초과수익(진짜 평균 0):
+# 검증 보고서와 같은 b = 42의 95% 구간이 실제로 0을 95% 가까이 포함해야 한다
+_nb = 1700
+_rg = _garch_t(_nb + 70, 200, np.random.default_rng(5))
+_cc = np.vstack([np.zeros(200), np.cumsum(_rg, 0)])
+_exr = ((_cc[63:63 + _nb] - _cc[:_nb] > 0) - 1.0) * _rg[64:64 + _nb]
+_cov = np.mean([(lambda lo, hi: lo <= 0 <= hi)(*qe.block_bootstrap_ci(_exr[:, i], 42, n_boot=500)) for i in range(200)])
+assert _cov > 0.9, _cov
+
+# ---------------- 상장폐지 종목까지 포함한 종목 범위 (KRX 일별매매정보 + Yahoo) ----------------
+# 지금 상장된 종목은 Yahoo 수정주가 그대로, Yahoo에 없는 폐지 종목은 KRX 등락률로 주가를 만들고 폐지 뒤엔 마지막 가격에 멈춤(현금).
+# 우선주는 빼고, 폐지 뒤엔 종목 범위에서 빠지며, 들고 있던 기간의 정리매매 폭락은 수익률에 그대로 들어가야 한다
+_dk = pd.bdate_range("2021-01-04", periods=400)
+_yc = pd.DataFrame({"000010": 100 * np.exp(np.cumsum(np.full(400, 0.001)))}, index=_dk)
+_chg = pd.DataFrame({"000010": 0.1, "999990": 0.2, "999995": 0.0}, index=_dk)
+_chg.loc[_dk[290:295], "999990"] = -50.0                          # 정리매매: 닷새 동안 매일 −50%
+_kclose = pd.DataFrame({"000010": 50000.0, "999990": 1000.0, "999995": 500.0}, index=_dk)
+_kclose.loc[_dk[295]:, "999990"] = np.nan                         # 300일째부터 없음 = 상장폐지
+_chg.loc[_dk[295]:, "999990"] = np.nan
+_krx = {"close": _kclose, "chg_pct": _chg, "volume": _kclose * 0 + 1000.0, "value": _kclose * 1000.0,
+        "cap": _kclose * 1e6, "shares": _kclose * 0 + 1e6,
+        "names": pd.Series({"000010": "가", "999990": "폐지된회사", "999995": "가우"})}
+_mc2, _mr2, _mv2, _mn2 = uv.merge_krx(_yc, _yc.copy(), _yc * 0 + 1000.0, _krx)
+assert list(_mc2.columns) == ["000010", "999990"] and _mn2.to_dict() == {"999990": "폐지된회사"}     # 우선주(…우) 제외
+assert np.isclose(_mc2["999990"].iloc[295] / _mc2["999990"].iloc[289], 0.5 ** 5)                  # 정리매매 손실 반영
+assert (_mc2["999990"].iloc[295:] == _mc2["999990"].iloc[294]).all() and _mr2["999990"].iloc[295:].isna().all()
+assert np.allclose(_mc2["000010"], _yc["000010"])                                                 # 살아 있는 종목은 그대로
+_u2, _ = uv.point_in_time_universe(_mr2, _mv2, top_n=5, value=_krx["value"].reindex(columns=_mc2.columns))
+assert _u2["999990"].iloc[260] and not _u2["999990"].iloc[300:].any()                             # 폐지 뒤엔 범위 밖
+assert uv.load_krx(Path(tempfile.gettempdir()) / "없는파일.pkl") is None
 
 # ---------------- 실제 데이터 검증 보고서 (데이터는 합성으로 바꿔 끼움) ----------------
 import validation as vd
@@ -798,6 +1038,9 @@ try:
     assert _vr["방향 초과 95% 하한"] <= _vr["방향 초과수익(연)"] <= _vr["방향 초과 95% 상한"]
     assert _vr["국면 초과 95% 하한"] <= _vr["국면 초과수익(연)"] <= _vr["국면 초과 95% 상한"]
     assert _vr["방향 전략 경제적 가치"] == ("있음" if _vr["방향 초과 95% 하한"] > 0 else "확인 안 됨")
+    assert _vr["분할 초과 95% 하한"] <= _vr["분할 초과수익(연)"] <= _vr["분할 초과 95% 상한"] and 0 < _vr["분할 보유 평균 비중"] <= 1
+    assert len(_vr["_obs"]) > 0 and (_vr["_obs"]["c"] >= 2 * vd.COST_BPS * 1e-4).all()      # 비용 = 수수료 양쪽 + 세금
+    assert _vr["ES 검정"] in ("통과", "기각") and _vr["VaR 검증 일수"] > 500 and _vr["GARCH 진단"].count("수렴") == 1
     # 같은 데이터로 앱 방향 예측 탭과 같은 숫자 (같은 함수·같은 기본 설정)
     _wfv, _ = dr.walk_forward(_hist, 21, None, alt=None, ticker="005930.KS")
     _evv = dr.evaluate(_wfv, 21, np.log(_hist).diff(), 3.0, lag=1, sell_tax=kc.sell_tax_rate(_hist.index, "KOSPI"))
@@ -806,6 +1049,7 @@ try:
         _rows = vd.run(["005930.KS", "없는종목.KS"], out_dir=_vd, say=lambda m: None)
         _md = (Path(_vd) / "README.md").read_text(encoding="utf-8")
         assert "테스트전자" in _md and "계산하지 못한 종목" in _md and "없는종목.KS: ValueError" in _md   # 한 종목 실패해도 나머지는 보고
+        assert "## 21일 분할 보유 전략" in _md and "## 예측 확률 구간별 실제 21일 수익" in _md and "## 하루 VaR·ES 검정" in _md
         _sv = pd.read_csv(Path(_vd) / "summary.csv")
         assert len(_sv) == 2 and pd.isna(_sv.loc[0, "오류"]) and "주가 데이터 없음" in _sv.loc[1, "오류"]
 finally:

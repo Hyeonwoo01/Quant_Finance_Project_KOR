@@ -243,7 +243,7 @@ def sentiment_check(rows, h, min_n=10):
 
 
 def check():
-    """데이터 연결 점검 (GitHub Actions에서 코드가 바뀔 때마다): 지수·주식·ETF 예측, 코스피200(네이버 차트), KRX 전 종목 시세 접근을 확인."""
+    """데이터 연결 점검 (GitHub Actions에서 코드가 바뀔 때마다): 지수·주식·ETF 예측, 코스피200(네이버 차트), API 키, KRX 일별매매정보 해석."""
     ok = True
     for t in ("^KS11", "005930.KS", "069500.KS"):
         row = _predict_retry(t, tries=2, wait=20)
@@ -258,12 +258,17 @@ def check():
         ok = False
     import kr_data
     print("API 키 점검:", key_check(), flush=True)
-    try:
-        snap = kr_data.krx_daily_all(pd.Timestamp.now(tz="Asia/Seoul").normalize().tz_localize(None) - pd.offsets.BDay(1))
-        print(f"KRX 전 종목 시세: {len(snap)}종목, 열 {list(snap.columns)[:12]}", flush=True)
-        print(snap.head(3).to_string(), flush=True)
-    except Exception as e:                     # 아직 필수 아님 (상장폐지 포함 종목 범위를 만들 때 쓸 예정) → 실패해도 점검은 통과
-        print(f"KRX 전 종목 시세: 받지 못함 ({type(e).__name__}: {str(e)[:200]})", flush=True)
+    if kr_data.get_key("KRX_API_KEY"):        # 상장폐지 포함 종목 범위에 쓰는 일별매매정보를 실제로 해석해 본다 (필수 아님)
+        try:
+            day = pd.Timestamp.now(tz="Asia/Seoul").normalize().tz_localize(None) - pd.offsets.BDay(1)
+            rows = kr_data.krx_api(kr_data.KRX_DAILY["STK"], day)
+            print("KRX 유가증권 일별 열:", list(rows[0].keys()) if rows else "없음 (휴장일?)", flush=True)
+            snap = kr_data.parse_krx_daily(rows)
+            sam = snap[snap["code"] == "005930"]
+            print(f"KRX 해석: {len(snap)}종목 · 삼성전자 " + (sam.drop(columns="name").to_dict("records")[0].__repr__() if len(sam) else "없음"),
+                  flush=True)
+        except Exception as e:
+            print(f"KRX 일별매매정보: 해석 실패 ({type(e).__name__}: {str(e)[:200]})", flush=True)
     return ok
 
 
