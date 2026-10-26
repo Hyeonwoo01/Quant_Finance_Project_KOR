@@ -54,7 +54,10 @@ FEATURES = {
     "roe": ("ROE (수익성)", +1),
 }
 MODEL_LABELS = {"composite": "고정 가중 합산 (학계 알려진 방향, 학습 없음)", "ridge": "릿지 회귀",
-                "gbm": "그래디언트 부스팅", "momentum": "모멘텀 단일 (기준)", "auto": "⭐ 자동 선택"}
+                "gbm": "그래디언트 부스팅", "momentum": "모멘텀 단일 (기준)", "lowvol": "저변동성 단일 (기준)",
+                "value": "가치(B/M) 단일 (기준)", "auto": "⭐ 자동 선택"}
+# 비교만 하는 단순 기준 전략 (특징 하나, 알려진 방향) — 자동 선택 후보에 넣지 않는다 (후보를 늘리면 1등 착시가 커짐)
+BASELINES = {"lowvol": ("vol_63", -1), "value": ("bm", +1)}
 
 
 # ---------------- 데이터 받기 ----------------
@@ -266,6 +269,9 @@ def build_panel(top_n=TOP_N, cap_limit=None, end=None):
         names = pd.concat([names, extra_names[~extra_names.index.isin(names.index)]])
         added = [c for c in extra_names.index if c in keep]
         n_delisted = int(sum(close_raw[c].last_valid_index() < idx[-1] for c in added))    # 마지막 날 전에 거래가 끝남
+    # 거래가 없는 날(거래정지 등)은 직전 가격 유지 → 들고 있던 종목의 수익률이 결측으로 조용히 빠지지 않게 한다.
+    # 범위(universe)는 원래 주가(close_raw)로 정하므로 거래가 없는 날의 종목은 새로 고르지 않는다
+    close = close.ffill()
     lc = np.log(close)
     r = lc.diff()
     universe, liq = point_in_time_universe(close_raw, volume, top_n, value)
@@ -330,9 +336,15 @@ def _read_cache(name):
 
 
 def cross_rank(df, universe):
-    """날짜별 종목 간 백분위 순위 − 0.5 (범위 밖·결측은 0 = 중간값). 극단값 영향이 없어진다."""
+    """특징용: 날짜별 종목 간 백분위 순위 − 0.5 (범위 밖·결측은 0 = 중간값). 극단값 영향이 없어진다."""
     x = df.where(universe)
     return (x.rank(axis=1, pct=True) - 0.5).fillna(0.0).where(universe)
+
+
+def target_rank(fwd, universe):
+    """정답용: 미래 수익률이 실제로 있는 종목끼리만 매긴 순위 − 0.5. 결측은 NaN으로 남겨 학습에서 뺀다.
+    (특징처럼 중간값 0으로 채우면 '결과를 모르는 종목'이 '평균만큼 오른 종목'으로 학습된다.)"""
+    return fwd.where(universe).rank(axis=1, pct=True) - 0.5
 
 
 # ---------------- 모델 ----------------
@@ -362,19 +374,22 @@ def walk_forward(panel, h=21, train_years=2, sample_every=5, refit_models=("ridg
     cols = [c for c in FEATURES if panel["coverage"].get(c, 0) > 0.3]       # 데이터가 너무 빈 신호는 제외
     R = {c: cross_rank(F[c], universe) for c in cols}
     fwd_exec = np.log(close.shift(-h - exec_lag) / close.shift(-exec_lag))   # 실제 체결 이후 h일 수익률
-    Y = cross_rank(fwd_exec, universe)                                       # 학습 목표 = 채점 대상: 체결 이후 수익률 '순위'
+    Y = target_rank(fwd_exec, universe)                                      # 학습 목표 = 채점 대상: 체결 이후 수익률 '순위'
     idx = close.index
     first = universe.any(axis=1).values.argmax() + 252 * train_years
     rebal = list(range(first, len(idx), h))
     if rebal and rebal[-1] != len(idx) - 1:
         rebal.append(len(idx) - 1)                                            # 마지막 = 오늘의 추천
 
-    scores = {m: {} for m in ("composite", "momentum", *refit_models)}
+    scores = {m: {} for m in ("composite", "momentum", *BASELINES, *refit_models)}
     for i, t in enumerate(rebal):
         d = idx[t]
         u = universe.loc[d]
         scores["composite"][d] = composite_score(R, d, universe, cols)
         scores["momentum"][d] = R["mom_12_1"].loc[d].where(u)
+        for m, (c, sgn) in BASELINES.items():
+            if c in R:
+                scores[m][d] = sgn * R[c].loc[d].where(u)
         tr_dates = idx[universe.any(axis=1).values.argmax():t - h - exec_lag + 1][::sample_every]   # 결과가 t까지 확정된 날만
         if len(tr_dates) > 50 and refit_models:
             keys, X = _stack(R, tr_dates, universe, cols)
@@ -408,7 +423,8 @@ def walk_forward(panel, h=21, train_years=2, sample_every=5, refit_models=("ridg
             pick = "composite"
         else:
             # 학습 모델은 초기엔 점수가 없을 수 있음 → 과거 6회 이상 채점된 모델만 후보
-            means = {m: ic[m].reindex(past).mean() for m in scores if ic[m].reindex(past).notna().sum() >= 6}
+            means = {m: ic[m].reindex(past).mean() for m in scores
+                     if m not in BASELINES and ic[m].reindex(past).notna().sum() >= 6}
             pick = max(means, key=means.get) if means else "composite"
             pick = pick if means.get(pick, 1) > 0 else None
         chosen[d] = pick or "none"
@@ -417,7 +433,8 @@ def walk_forward(panel, h=21, train_years=2, sample_every=5, refit_models=("ridg
     ic["auto"] = scores["auto"].apply(lambda row: _ic(row, fwd_r.loc[row.name]), axis=1)
     return {"scores": scores, "ic": ic, "chosen": pd.Series(chosen), "rebal": rdates, "fwd": fwd_r,
             "cols": cols, "R": R, "h": h, "universe": universe, "exec_lag": exec_lag,
-            "blocked": _blocked_orders(panel, rdates, exec_lag)}
+            "blocked": _blocked_orders(panel, rdates, exec_lag),
+            "vol": F["vol_63"].reindex(rdates) if "vol_63" in F else None}           # 위험 반영 비중용 (그날까지의 63일 변동성)
 
 
 def _blocked_orders(panel, rdates, exec_lag):
@@ -445,10 +462,12 @@ def _ic(score, fwd):
 
 
 # ---------------- 평가 ----------------
-def evaluate(wf, cost_bps=15.0, q=5, sell_tax=False):
-    """각 모델: 상위 1/q 동일가중 포트폴리오 vs 전체 동일가중, IC, 회전율·비용 반영.
+def evaluate(wf, cost_bps=15.0, q=5, sell_tax=False, weighting="equal", models=None):
+    """각 모델: 상위 1/q 포트폴리오 vs 전체 동일가중, IC, 회전율·비용 반영.
 
     cost_bps: 사고팔 때 각각 내는 수수료·체결 비용. sell_tax=True면 교체로 판 비중에 그날의 코스피 증권거래세를 더 뺀다.
+    weighting: 'equal'(동일 비중) 또는 'inv_vol'(63일 변동성 역수 비중, 종목당 동일 비중의 2배 상한 — 위험을 비중에 반영).
+    회전율 = ½ Σ|비중 변화| (판 비중 = 산 비중). models: 계산할 모델만 (기본: 전부).
     """
     h, fwd, univ = wf["h"], wf["fwd"], wf["universe"]
     rows, curves = {}, {}
@@ -458,26 +477,20 @@ def evaluate(wf, cost_bps=15.0, q=5, sell_tax=False):
     uni = ret.where(univ.loc[dates]).mean(axis=1)
     ix = np.minimum(univ.index.get_indexer(dates) + wf.get("exec_lag", 0), len(univ.index) - 1)
     exec_dates = univ.index[ix]                                              # 실제로 사고파는 날 (세율은 이날 기준)
-    blocked = wf.get("blocked")
     for m, S in wf["scores"].items():
-        top_r, bot_r, turn, prev, n_blocked = [], [], [], None, 0
+        if models is not None and m not in models:
+            continue
+        hold, n_blocked = _holdings(wf, m, q)
+        top_r, bot_r, turn, w_prev = [], [], [], None
         for d in dates:
+            w = _weights(hold[d], d, wf, weighting)
+            r = ret.loc[d, w.index]
+            ok = r.notna()                                                   # (결측이면 있는 종목끼리 비중을 다시 맞춤)
+            top_r.append(float((r[ok] * w[ok]).sum() / w[ok].sum()) if ok.any() else 0.0)   # 아무것도 못 샀으면 현금
             s = S.loc[d].dropna()
-            if len(s) < 20:                               # 점수 없음(자동 선택이 '고르지 않음') → 전체 보유
-                members = set(univ.columns[univ.loc[d]])
-                top_r.append(uni.loc[d]); bot_r.append(uni.loc[d])
-            else:
-                k = len(s) // q
-                members = set(s.nlargest(k).index)
-                if blocked is not None:                   # 하한가·거래정지면 못 팔아 계속 보유, 상한가·거래정지면 못 삼
-                    held = prev or set()
-                    keep = {c for c in held - members if blocked["sell"].at[d, c]}
-                    skip = {c for c in members - held if blocked["buy"].at[d, c]}
-                    members, n_blocked = (members - skip) | keep, n_blocked + len(keep) + len(skip)
-                top_r.append(ret.loc[d, list(members)].mean() if members else 0.0)      # 아무것도 못 샀으면 현금
-                bot_r.append(ret.loc[d, list(s.nsmallest(k).index)].mean())
-            turn.append(1.0 if prev is None else 1 - len(members & prev) / max(len(members), 1))
-            prev = members
+            bot_r.append(uni.loc[d] if len(s) < 20 else ret.loc[d, list(s.nsmallest(len(s) // q).index)].mean())
+            turn.append(1.0 if w_prev is None else 0.5 * float(w.sub(w_prev, fill_value=0.0).abs().sum()))
+            w_prev = w
         top = pd.Series(top_r, index=dates)
         turn_s = pd.Series(turn, index=dates)
         net = top - turn_s * 2 * cost_bps * 1e-4                            # 판 만큼 사고 → 양방향 비용
@@ -497,6 +510,59 @@ def evaluate(wf, cost_bps=15.0, q=5, sell_tax=False):
         curves[m] = pd.DataFrame({"상위 20% (비용 후)": (1 + net).cumprod(), "하위 20%": (1 + pd.Series(bot_r, index=dates)).cumprod()})
     curves["_universe"] = (1 + uni).cumprod()
     return pd.DataFrame(rows).T, curves
+
+
+def _weights(members, d, wf, weighting="equal", cap_mult=2.0):
+    """보유 종목 → 비중 (합 1). 'inv_vol': 그날까지의 63일 변동성 역수에 비례, 종목당 동일 비중의 cap_mult배 상한.
+    변동성이 없는 종목은 나머지의 중앙값을 쓰고, 변동성 자료가 아예 없으면 동일 비중."""
+    if not members:
+        return pd.Series(dtype=float)
+    eq = pd.Series(1.0 / len(members), index=list(members))
+    vol = wf.get("vol")
+    if weighting != "inv_vol" or vol is None:
+        return eq
+    v = vol.loc[d].reindex(eq.index)
+    inv = (1.0 / v).where(v > 0)
+    if inv.notna().sum() == 0:
+        return eq
+    inv = inv.fillna(inv.median())
+    cap = cap_mult / len(inv)                            # cap_mult ≥ 1이면 항상 가능 (상한 × 종목 수 ≥ 1)
+    w, fixed = inv / inv.sum(), pd.Series(False, index=inv.index)
+    while ((w > cap + 1e-12) & ~fixed).any():            # 상한에 닿은 종목은 상한으로 묶고, 남은 몫을 나머지에 비례 배분
+        fixed |= w > cap + 1e-12
+        w[fixed] = cap
+        w[~fixed] = inv[~fixed] / inv[~fixed].sum() * (1 - cap * fixed.sum())
+    return w
+
+
+def cost_sensitivity(wf, costs=(0.0, 5.0, 10.0, 20.0, 40.0), sell_tax=False, model="auto", q=5):
+    """수수료·체결 비용(슬리피지 포함, bp, 매수·매도 각각)을 바꿔 다시 계산한 초과수익 — 신호가 비용에 얼마나 약한지.
+    반환: (비용별 표, 손익분기 비용 bp = 초과수익이 0이 되는 비용; 비용 0에서도 0 이하면 0)."""
+    rows = {}
+    for c in costs:
+        t = evaluate(wf, c, q, sell_tax=sell_tax, models=[model])[0].loc[model]
+        rows[f"{c:g}bp"] = {"초과수익(연, 비용후)": t["상위20% 초과수익(연, 비용후)"], "t값": t["초과수익 t값"],
+                            "최대 낙폭(비용후)": t["최대 낙폭(비용후)"]}
+    tab = pd.DataFrame(rows).T
+    e0, e1 = tab.iloc[0, 0], tab.iloc[-1, 0]
+    slope = (e0 - e1) / (costs[-1] - costs[0]) if costs[-1] > costs[0] else np.nan        # 비용 1bp당 줄어드는 연 초과수익
+    breakeven = float(max(e0, 0.0) / slope) if np.isfinite(slope) and slope > 0 else np.nan
+    return tab, breakeven
+
+
+def market_breakdown(curves, model="auto"):
+    """리밸런싱 기간을 그 기간 종목 범위 평균 수익률의 3분위(하락·횡보·상승)로 나눠, 구간별 상위 20%(비용 후)의 초과수익.
+    특정 시장에서만 벌었는지(예: 상승장에서만) 본다."""
+    uni = _period_returns(curves["_universe"])
+    top = _period_returns(curves[model]["상위 20% (비용 후)"])
+    ex = (top - uni).dropna()
+    uni = uni.reindex(ex.index)
+    if len(ex) < 9:
+        return None
+    lab = pd.qcut(uni.rank(method="first"), 3, labels=["하락", "횡보", "상승"])
+    g = pd.DataFrame({"구간": lab, "시장": uni, "초과": ex}).groupby("구간", observed=False)
+    return pd.DataFrame({"기간 수": g.size(), "시장 평균(기간)": g["시장"].mean(), "초과수익 평균(기간)": g["초과"].mean(),
+                         "초과 > 0 비율": g["초과"].apply(lambda x: (x > 0).mean())})
 
 
 # ---------------- 알려진 요인으로 설명되는가 ----------------
@@ -563,13 +629,26 @@ def selection_check(curves, h):
 
 # ---------------- 운용 규모와 위험 ----------------
 def _holdings(wf, model="auto", q=5):
-    """리밸런싱 날짜별 보유 종목 (evaluate와 같은 규칙: 점수 상위 1/q, 점수가 없으면 전체 종목)."""
+    """리밸런싱 날짜별 실제 보유 종목: 점수 상위 1/q, 점수가 없으면(자동 선택이 '고르지 않음') 전체 종목.
+    체결일에 하한가·거래정지면 못 판 종목은 계속 보유하고, 상한가·거래정지면 못 산 종목은 빼고 산다 (wf['blocked']).
+    반환: ({날짜: 종목 목록}, 막힌 주문 수). evaluate·capacity가 같은 규칙을 쓴다."""
+    univ, blocked = wf["universe"], wf.get("blocked")
     known = wf["fwd"].notna().sum(axis=1) > 20
-    out = {}
+    out, prev, n_blocked = {}, None, 0
     for d in [d for d in wf["rebal"] if known.loc[d]]:
         s = wf["scores"][model].loc[d].dropna()
-        out[d] = (list(wf["universe"].columns[wf["universe"].loc[d]]) if len(s) < 20 else list(s.nlargest(len(s) // q).index))
-    return out
+        if len(s) < 20:
+            members = set(univ.columns[univ.loc[d]])
+        else:
+            members = set(s.nlargest(len(s) // q).index)
+            if blocked is not None:
+                held = prev or set()
+                keep = {c for c in held - members if blocked["sell"].at[d, c]}
+                skip = {c for c in members - held if blocked["buy"].at[d, c]}
+                members, n_blocked = (members - skip) | keep, n_blocked + len(keep) + len(skip)
+        out[d] = sorted(members)
+        prev = members
+    return out, n_blocked
 
 
 def capacity(wf, panel, curves, model="auto", capitals=(1e7, 1e8, 1e9, 1e10, 1e11), impact=1.0, q=5):
@@ -579,7 +658,7 @@ def capacity(wf, panel, curves, model="auto", capitals=(1e7, 1e8, 1e9, 1e10, 1e1
     리밸런싱마다 새로 사거나 판 종목만 비용을 낸다 (종목당 금액 = 자본 / 보유 종목 수, 거래대금은 그날 기준 63일 평균).
     반환: 자본별 평균 주문 비율, 추가 비용(연), 비용 반영 초과수익(연)과 t값 — 수수료·세금은 curves에 이미 반영된 것에 더한다.
     """
-    hold = _holdings(wf, model, q)
+    hold, _ = _holdings(wf, model, q)
     dates = list(hold)
     adv = np.exp(panel["feat"]["liq"])
     vol = np.log(panel["close"]).diff().rolling(63, min_periods=40).std()
@@ -746,10 +825,10 @@ PICK_COLUMNS = ["date", "model", "n", "codes", "names",
                 *[f"{k}_{h}" for h in SCORE_HORIZONS for k in ("basket", "market")], "version"]
 
 
-def _optional(fn, *args):
+def _optional(fn, *args, **kwargs):
     """부가 분석은 실패해도 나머지를 막지 않는다 (데이터 열이 빠진 경우 등) → None."""
     try:
-        return fn(*args)
+        return fn(*args, **kwargs)
     except Exception:
         return None
 
@@ -758,12 +837,18 @@ def results(panel, wf, cost_bps=WEEKLY_COST, sell_tax=False):
     """앱 '코스피 종목 고르기' 탭이 보여 주는 결과 묶음. 계산 결과만 들어 있고 원본 시세는 없다."""
     table, curves = evaluate(wf, cost_bps, sell_tax=sell_tax)
     d, pick, top, bottom = current_picks(panel, wf)
+    rw = evaluate(wf, cost_bps, sell_tax=sell_tax, weighting="inv_vol", models=["auto"])[0]     # 위험 반영 비중
+    ch = wf["chosen"]
     return {"table": table, "curves": curves, "ic": wf["ic"]["auto"], "chosen": wf["chosen"], "date": d,
             "pick": pick, "top": top, "bottom": bottom, "coverage": panel["coverage"], "cols": wf["cols"],
             "n_univ": int(panel["universe"].iloc[-1].sum()), "factors": factor_exposure(wf, curves),
             "selection": selection_check(curves, wf["h"]), "capacity": _optional(capacity, wf, panel, curves),
             "risk": _optional(lambda: basket_risk(panel, current_basket(wf))),
-            "krx": bool(panel.get("krx")), "n_delisted": int(panel.get("n_delisted", 0))}
+            "krx": bool(panel.get("krx")), "n_delisted": int(panel.get("n_delisted", 0)),
+            "risk_weighted": rw.loc["auto"] if "auto" in rw.index else None,
+            "cost_sens": _optional(cost_sensitivity, wf, sell_tax=sell_tax),
+            "market": _optional(market_breakdown, curves),
+            "switches": int((ch != ch.shift()).iloc[1:].sum()) if len(ch) > 1 else 0}
 
 
 def finished_end(index, now=None):

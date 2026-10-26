@@ -258,11 +258,45 @@ def synth_panel(seed, n_stock=80, n_day=800, shock_after=None):
     return {"feat": F, "close": close, "universe": univ, "names": pd.Series(codes, index=codes),
             "coverage": {"mom_12_1": 1.0, "frgn_flow_21": 1.0}}
 
+# 정답 순위: 미래 수익률이 없는 종목은 중간값(0)이 아니라 NaN → 학습에서 빠짐 (특징 순위는 결측 = 중간값 그대로)
+_fw = pd.DataFrame([[0.1, np.nan, -0.1, 0.0]], columns=list("abcd"), index=[pd.Timestamp("2024-01-02")])
+_uv = pd.DataFrame([[True, True, True, False]], columns=list("abcd"), index=_fw.index)
+_tr = uv.target_rank(_fw, _uv).iloc[0]
+assert np.allclose(_tr[["a", "c"]].values, [0.5, 0.0]) and np.isnan(_tr["b"]) and np.isnan(_tr["d"])   # a·c 둘 중 순위
+assert uv.cross_rank(_fw, _uv).iloc[0]["b"] == 0.0
+
 pa = synth_panel(5)
 wf_u = uv.walk_forward(pa, h=21, train_years=1, refit_models=("ridge",))
 tab, _ = uv.evaluate(wf_u, cost_bps=0)
 assert tab.loc["ridge", "평균 IC"] > 0.1 and tab.loc["ridge", "상위20% 초과수익(연, 비용후)"] > 0, tab
 assert tab.loc["composite", "평균 IC"] > 0.05            # 고정 가중도 (외국인 수급 + 방향) 신호를 반영
+# 비용 민감도: 비용이 늘면 초과수익이 줄고, 손익분기 비용에서 정확히 0 (비용은 초과수익에 선형)
+_cs, _be = uv.cost_sensitivity(wf_u)
+assert _cs["초과수익(연, 비용후)"].is_monotonic_decreasing and _be > 0
+assert abs(uv.evaluate(wf_u, _be, models=["auto"])[0].loc["auto", "상위20% 초과수익(연, 비용후)"]) < 1e-9
+# 시장 구간별: 기간을 범위 평균 수익률 3분위로 나눔 (모든 기간이 한 번씩)
+_mb = uv.market_breakdown(uv.evaluate(wf_u, 5)[1])
+assert list(_mb.index) == ["하락", "횡보", "상승"] and _mb["기간 수"].sum() == tab.loc["auto", "리밸런싱 수"]
+assert _mb["시장 평균(기간)"].is_monotonic_increasing
+# 위험 반영 비중: 변동성 역수에 비례, 종목당 동일 비중의 2배 상한, 합 1. 변동성 자료가 없으면 동일 비중
+_wv = {"vol": pd.DataFrame([[0.01, 0.02, 0.04, 0.08]], columns=list("abcd"), index=[0])}
+_ww = uv._weights(list("abcd"), 0, _wv, "inv_vol")
+assert np.isclose(_ww.sum(), 1) and _ww.max() <= 0.5 + 1e-12 and list(_ww.sort_values(ascending=False).index) == list("abcd")
+assert np.allclose(uv._weights(list("abcd"), 0, {"vol": None}, "inv_vol"), 0.25)
+_wfv = dict(wf_u)
+_wfv["vol"] = pd.DataFrame(np.random.default_rng(0).uniform(0.01, 0.04, (len(wf_u["rebal"]), 80)),
+                           index=wf_u["rebal"], columns=wf_u["universe"].columns)
+assert uv.evaluate(_wfv, 5, weighting="inv_vol", models=["auto"])[0].shape[0] == 1
+assert np.isclose(uv.evaluate(wf_u, 5, weighting="inv_vol")[0].loc["auto", "상위20% 초과수익(연, 비용후)"],   # 변동성 자료 없음
+                  uv.evaluate(wf_u, 5)[0].loc["auto", "상위20% 초과수익(연, 비용후)"])                          # → 동일 비중과 같음
+# 기준 전략(저변동성 단일 등)은 같은 조건으로 표에 나오지만 자동 선택 후보는 아니다
+_pv = synth_panel(6)
+_pv["feat"]["vol_63"] = pd.DataFrame(np.random.default_rng(7).uniform(0.01, 0.04, _pv["close"].shape),
+                                     index=_pv["close"].index, columns=_pv["close"].columns)
+_pv["coverage"]["vol_63"] = 1.0
+_wfb = uv.walk_forward(_pv, h=21, train_years=1, refit_models=("ridge",))
+assert "lowvol" in _wfb["scores"] and "value" not in _wfb["scores"] and not _wfb["chosen"].isin(list(uv.BASELINES)).any()
+assert "lowvol" in uv.evaluate(_wfb, 5)[0].index
 Tcut = 700                                                # 첫 리밸런싱(512일) 이후 리밸런싱 9회가 비교됨
 pb = synth_panel(5, shock_after=Tcut)
 wf_b = uv.walk_forward(pb, h=21, train_years=1, refit_models=("ridge",))
@@ -657,7 +691,7 @@ assert isinstance(repro.code_version(), str) and repro.fingerprint(_s1.iloc[:0])
 _pc = synth_panel(5)
 _pc["feat"]["liq"] = pd.DataFrame(np.log(1e11), index=_pc["close"].index, columns=_pc["close"].columns)   # 하루 거래대금 1,000억 원
 _tq, _cq = uv.evaluate(wf_u, cost_bps=0)
-_hold = uv._holdings(wf_u, "auto")
+_hold, _ = uv._holdings(wf_u, "auto")
 _gross = pd.Series({d: (np.exp(wf_u["fwd"].loc[d, c]) - 1).mean() for d, c in _hold.items()})
 _curve = _cq["auto"]["상위 20% (비용 후)"]
 assert np.allclose((_curve / _curve.shift(1).fillna(1.0) - 1).values, _gross.values)      # evaluate와 같은 보유 종목
@@ -870,6 +904,13 @@ with tempfile.TemporaryDirectory() as _td:
     assert len(uv.read_picks(Path(_td) / "picks.csv")) == 1
     _kfw = uv.load_kr_factors(Path(_td) / "kr_factors.csv")              # 매주 계산이 한국판 요인도 저장
     assert list(_kfw.columns) == ["Mkt-RF", "Mom", "RF"] and _kfw.index[-1] == _cw.index[-1]   # 시총·재무가 없는 패널
+    # 결과 묶음: 비용 민감도·손익분기, 시장 구간별, 위험 반영 비중, 자동 선택이 바뀐 횟수 → 검증 보고서 요약까지
+    _U = _wres[(63, 1, True)]
+    assert _U["cost_sens"][0].shape[0] == 5 and _U["switches"] >= 0 and _U["risk_weighted"] is not None
+    import validation as _vdr
+    _rk = _vdr.ranking_summary(_td)
+    _mdr = _vdr.report_markdown([], _rk, "2026-10-26", "test")
+    assert "손익분기 비용" in _mdr and "자동 선택이 바뀐 횟수" in _mdr and "기준 전략" in _mdr
 
 # ---------------- 한국판 요인 (파마-프렌치 방식의 근사) ----------------
 # 심어 둔 구조: 시가총액이 작을수록, 장부가/시총이 클수록 매일 조금 더 오른다 → 소형주·가치 요인이 양(+)으로 나와야

@@ -90,6 +90,7 @@ def validate(ticker):
         "방향 전략 보유 비중": ev["time_in_market"],
         "방향 초과수익(연)": d_ex, "방향 초과 95% 하한": d_lo, "방향 초과 95% 상한": d_hi,
         "가정 바꿔 통과(7개 중)": passes, "방향 DSR": sel["dsr"] if sel else np.nan,
+        "방향 자동 선택 바뀐 횟수": int((wf["chosen"] != wf["chosen"].shift()).iloc[1:].sum()),
         "방향 전략 경제적 가치": "있음" if d_lo > 0 else "확인 안 됨",
         "분할 보유 연 수익률": h_ret, "분할 보유 샤프": h_sh, "분할 보유 최대 낙폭": evh["mdd"],
         "분할 보유 평균 비중": evh["time_in_market"],
@@ -141,7 +142,16 @@ def ranking_summary(rank_dir=uv.RANK_DIR):
     a = U["table"].loc["auto"]
     fx, sel = U.get("factors") or {}, U.get("selection") or {}
     picks = uv.picks_summary(uv.read_picks(Path(rank_dir) / uv.PICKS_PATH.name))
+    rw, cs = U.get("risk_weighted"), U.get("cost_sens")
     return {"데이터": f"{w['data_end'].date()}까지", "리밸런싱 수": a["리밸런싱 수"],
+            "상장폐지 포함": f"예 ({U.get('n_delisted', 0)}종목)" if U.get("krx") else "아니오",
+            "자동 선택 바뀐 횟수": U.get("switches", np.nan),
+            "손익분기 비용(bp)": cs[1] if cs is not None else np.nan,
+            "변동성 역가중 초과수익(연)": rw["상위20% 초과수익(연, 비용후)"] if rw is not None else np.nan,
+            "변동성 역가중 t값": rw["초과수익 t값"] if rw is not None else np.nan,
+            "시장 구간별": U.get("market"),
+            "기준 전략": {uv.MODEL_LABELS[m]: U["table"].loc[m, "상위20% 초과수익(연, 비용후)"]
+                       for m in ("momentum", *uv.BASELINES) if m in U["table"].index},
             "초과수익(연, 비용후)": a["상위20% 초과수익(연, 비용후)"], "초과수익 t값": a["초과수익 t값"],
             "평균 IC": a["평균 IC"], "IC t값": a["IC t값"], "최대 낙폭(비용후)": a["최대 낙폭(비용후)"],
             "요인 알파(연)": fx.get("alpha", np.nan), "요인 알파 t값": fx.get("alpha_t", np.nan),
@@ -247,7 +257,17 @@ def report_markdown(rows, rank=None, when="", version="", buckets=None):
                   f"| {rank['데이터']} | {rank['리밸런싱 수']:.0f} | {_pct(rank['초과수익(연, 비용후)'])} | {_num(rank['초과수익 t값'], '{:+.1f}')} | "
                   f"{_num(rank['평균 IC'], '{:+.3f}')} | {_num(rank['IC t값'], '{:+.1f}')} | {_pct(rank['최대 낙폭(비용후)'])} | "
                   f"{_pct(rank['요인 알파(연)'])} | {_num(rank['요인 알파 t값'], '{:+.1f}')} | {_num(rank['1등 착시 보정(DSR)'], '{:.0%}')} | "
-                  f"{rank['실전 기록 채점 수(21일)']:.0f}번 · {_pct(rank['실전 기록 평균 초과수익(21일)'])} | {rank['경제적 가치']} |"]
+                  f"{rank['실전 기록 채점 수(21일)']:.0f}번 · {_pct(rank['실전 기록 평균 초과수익(21일)'])} | {rank['경제적 가치']} |",
+                  "",
+                  f"- 상장폐지 종목 포함: {rank['상장폐지 포함']} · 자동 선택이 바뀐 횟수: {_num(rank['자동 선택 바뀐 횟수'], '{:.0f}')}번",
+                  f"- 손익분기 비용: 매수·매도 각각 {_num(rank['손익분기 비용(bp)'], '{:.0f}')}bp (이보다 비용·슬리피지가 크면 초과수익 0 이하)",
+                  f"- 위험 반영 비중(변동성 역가중): 초과수익 {_pct(rank['변동성 역가중 초과수익(연)'])} (t {_num(rank['변동성 역가중 t값'], '{:+.1f}')})",
+                  "- 같은 조건의 기준 전략 초과수익(연): " + (", ".join(f"{k} {_pct(v)}" for k, v in rank["기준 전략"].items()) or "—")]
+        mk = rank.get("시장 구간별")
+        if mk is not None:
+            lines += ["", "| 시장 구간 (리밸런싱 기간의 범위 평균 수익률 3분위) | 기간 수 | 시장 평균 | 초과수익 평균 | 초과 > 0 비율 |", "|---|---|---|---|---|"]
+            lines += [f"| {k} | {b['기간 수']:.0f} | {_pct(b['시장 평균(기간)'])} | {_pct(b['초과수익 평균(기간)'])} | {_pct(b['초과 > 0 비율'], False)} |"
+                      for k, b in mk.iterrows()]
     bad = [r for r in rows if "오류" in r]
     if bad:
         lines += ["", "## 계산하지 못한 종목", ""] + [f"- {r['종목']}: {r['오류']}" for r in bad]
