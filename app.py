@@ -441,11 +441,15 @@ with tab_dir:
                     ("과거 검증 통과", "approve") if reliable else ("과거 검증 미통과", "elective")],
                    "최대 10년치 하루 주가로 여러 모델을 시험해, 최근 3년 동안 가장 잘 맞힌 모델을 골랐습니다.")
         ui.badges("모델에 들어간 데이터", [("가격 특징 · 사용", "approve")] + [
-            (f"{k} · {'사용' if v.startswith('사용') else '키 없음' if v == '키 없음' else '오류' if v.startswith('오류') else '없음'}",
+            (f"{k} · {'사용' if v.startswith('사용') else '키 없음' if v == '키 없음' else '오류' if v.startswith('오류') else '기간 짧아 제외' if v.startswith('기간이 짧아') else '없음'}",
              "approve" if v.startswith("사용") else "neutral" if v == "키 없음" else
              "reject" if v.startswith("오류") else "neutral") for k, v in alt_status.items()])
         if any(v == "키 없음" for v in alt_status.values()):
             st.caption("키 없음 = API 키가 없어 꺼짐. `api_keys.env` 파일에 `DART_API_KEY=…`, `ECOS_API_KEY=…`를 넣으면 켜집니다.")
+        short = {k: v for k, v in alt_status.items() if v.startswith("기간이 짧아")}
+        if short:
+            st.caption("기간 짧아 제외 = 가격 기록의 뒤쪽 절반에서야 시작하는 데이터. 넣으면 학습·검증 기간이 절반 넘게 줄어서 뺐습니다 ("
+                       + " / ".join(f"{k}: {v.split('(')[-1].rstrip(')')}" for k, v in short.items()) + ").")
         errs = {k: v for k, v in alt_status.items() if v.startswith("오류")}
         if errs:
             st.caption(" / ".join(f"{k}: {v}" for k, v in errs.items()))

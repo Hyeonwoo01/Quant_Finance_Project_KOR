@@ -60,8 +60,11 @@ def validate(ticker):
 
     # 방향 예측 (앱 get_direction과 같은 입력·같은 자동 선택)
     macro = md.load_macro(ticker)
-    alt, _ = ad.build_alt_features(ticker, close.index)
+    alt, alt_status = ad.build_alt_features(ticker, close.index)
+    row["대체 데이터"] = ", ".join(f"{k} {v}" for k, v in alt_status.items())
     wf, _ = dr.walk_forward(close, H, macro, alt=alt, ticker=ticker)
+    if wf.empty:
+        raise ValueError(f"학습에 쓸 기간이 너무 짧음 (모든 특징이 있는 날 기준, 대체 데이터: {row['대체 데이터'] or '없음'})")
     ev = dr.evaluate(wf, H, r, COST_BPS, lag=LAG, sell_tax=tax)
     rb = dr.robustness(wf, H, r, COST_BPS, lag=LAG, sell_tax=tax)
     sel = rb["selection"]
@@ -204,6 +207,7 @@ def run(tickers, out_dir=OUT_DIR, say=print):
             r = validate(t)
             rows.append(r)
             say(f"{t} ({r['이름']}): 완료 ({time.time() - t0:.0f}초) · 검증 기간 {r['검증 기간']}\n"
+                f"  대체 데이터: {r['대체 데이터'] or '없음'}\n"
                 f"  방향 예측: 적중률 {r['방향 적중률']:.1%} (항상 오른다 {r['항상 오른다 적중률']:.1%}), z {r['방향 z']:+.1f}, "
                 f"확률 정확도 {r['확률 정확도 개선']:+.1%} → 예측력 {r['방향 예측력']}\n"
                 f"  방향 전략: 연 {r['방향 전략 연 수익률']:+.1%} 샤프 {r['방향 전략 샤프']:.2f} 낙폭 {r['방향 전략 최대 낙폭']:.0%} | "
