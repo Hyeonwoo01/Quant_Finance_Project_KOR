@@ -176,15 +176,36 @@ def robust_table(df):
                  column_config={"검증 통과": st.column_config.TextColumn("검증 통과", alignment="center")})
 
 
+@st.cache_data(show_spinner=False)
+def get_kr_factors(stamp):
+    """매주 계산해 둔 한국판 일간 요인. stamp: 파일 시각 — 새로 커밋되면 다시 읽는다."""
+    return uv.load_kr_factors()
+
+
 def attribution_view(daily):
-    """보유/현금 타이밍 전략의 수익 분해 표 + 해석: 같은 비중으로 계속 들고 있었을 때보다 나았는지 (타이밍 실력)."""
-    sm = timing_attribution(daily)["summary"]
+    """보유/현금 타이밍 전략의 수익 분해 표 + 해석: 같은 비중으로 계속 들고 있었을 때보다 나았는지 (타이밍 실력),
+    한국판 요인(시장·소형주·가치·수익성·모멘텀)으로 설명되지 않는 부분이 있는지."""
+    ff = get_kr_factors(uv.kr_factors_stamp())
+    att = timing_attribution(daily, ff)
+    sm = att["summary"]
     st.dataframe(sm.style.format({"알파(연)": "{:+.1%}", "알파 t값": _signed(1), "노출(β)": "{:.2f}", "R²": "{:.2f}",
                                   "관측일": "{:,.0f}"}, na_rep="—"), width="stretch")
     a = sm.iloc[0]
-    st.caption(f"이 전략은 평균적으로 주식을 {a['노출(β)']:.0%}만큼 들고 있던 셈이고, 그 비중으로 계속 들고 있었을 때보다 "
-               f"1년에 {abs(a['알파(연)']):.1%} {'더' if a['알파(연)'] >= 0 else '덜'} 벌었습니다 (t = {a['알파 t값']:.1f}). "
-               "t가 2를 넘어야 타이밍 실력이 우연이 아니라고 봅니다.")
+    txt = (f"첫 줄: 이 전략은 평균적으로 주식을 {a['노출(β)']:.0%}만큼 들고 있던 셈이고, 그 비중으로 계속 들고 있었을 때보다 "
+           f"1년에 {abs(a['알파(연)']):.1%} {'더' if a['알파(연)'] >= 0 else '덜'} 벌었습니다 (t = {a['알파 t값']:.1f}). "
+           "t가 2를 넘어야 타이밍 실력이 우연이 아니라고 봅니다.")
+    if ff is None:
+        txt += " 한국판 요인 자료(ranking/kr_factors.csv)가 아직 없어 요인 분석은 생략했습니다."
+    elif "전략 (요인 모형)" in sm.index:
+        s_, b_ = sm.loc["전략 (요인 모형)"], sm.loc["단순 보유 (요인 모형)"]
+        txt += (f" 아래 두 줄: 한국 주식의 알려진 요인(시장·소형주·가치·수익성·모멘텀)으로 설명되는 부분을 빼고 남는 수익입니다. "
+                f"전략 {s_['알파(연)']:+.1%} vs 단순 보유 {b_['알파(연)']:+.1%} — 전략 쪽이 더 크면 그 차이가 요인으로 설명되지 않는 "
+                "타이밍 효과입니다. 요인은 코스피 거래대금 상위 200종목으로 매주 직접 만든 근사이고(무료 한국 요인 자료가 없음), "
+                "현금은 CD 91일 금리를 번다고 봤습니다. 요인은 매주 금요일에 갱신돼 그 뒤 며칠은 빠집니다.")
+    st.caption(txt)
+    if att["loadings"] is not None:
+        with st.expander("요인별 노출 자세히 (계수 · t값)"):
+            st.dataframe(att["loadings"].style.format("{:+.2f}", na_rep="—"), width="stretch")
 
 
 @st.cache_data(show_spinner=False)
@@ -762,6 +783,23 @@ with tab_pick:
             fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="교체 시점별 순위 정확도(IC)")
             ui.chart(fig)
 
+            kf = get_kr_factors(uv.kr_factors_stamp())
+            if kf is not None:
+                with st.expander("한국판 요인의 성과 (방향 예측·시장 국면의 수익 분해에 쓰는 일간 요인)"):
+                    cols = [c for c in uv.KR_FACTORS if c in kf and kf[c].notna().any()]
+                    cum = np.exp(np.log1p(kf[cols].fillna(0.0)).cumsum()).rename(columns=uv.KR_FACTORS)
+                    fig = go.Figure([go.Scatter(x=cum.index, y=cum[c], name=c) for c in cum.columns])
+                    fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="누적 (시작=1)",
+                                      hovermode="x unified", legend=dict(orientation="h", y=1.1))
+                    ui.chart(fig)
+                    yr = pd.DataFrame({"연 평균": kf[cols].mean() * 252, "연 변동성": kf[cols].std() * np.sqrt(252),
+                                       "t값": kf[cols].mean() / kf[cols].std() * np.sqrt(kf[cols].notna().sum())},
+                                      ).rename(index=uv.KR_FACTORS)
+                    st.dataframe(yr.style.format({"연 평균": "{:+.1%}", "연 변동성": "{:.1%}", "t값": _signed(1)}, na_rep="—"),
+                                 width="stretch")
+                    st.caption("같은 종목 범위(그때의 거래대금 상위 200)에서 21거래일마다 줄 세워 상위 30% − 하위 30%(동일 비중)를 들고 간 수익률입니다. "
+                               "시장은 시가총액 가중 − CD 91일 금리, 소형주는 시가총액 하위 − 상위, 가치는 장부가/시총, 수익성은 ROE(DART 재무제표, "
+                               "공시 다음 거래일부터), 모멘텀은 12-1개월 수익률 기준입니다. 파마-프렌치의 투자 요인은 자산 데이터가 없어 뺐습니다.")
             with st.expander("데이터·한계"):
                 cov = pd.Series({uv.FEATURES[c][0]: U["coverage"].get(c, 0) for c in uv.FEATURES})
                 st.markdown("**신호별 데이터 보유율** (30% 미만이면 모델에서 제외)")

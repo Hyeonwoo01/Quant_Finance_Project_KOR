@@ -711,6 +711,41 @@ with tempfile.TemporaryDirectory() as _td:
     assert _rd["codes"].iloc[0].split() == uv.current_basket(uv.walk_forward(_pw, 63, refit_models=("ridge",)))
     _, _wlog2 = uv.weekly(panel=_pw, out_dir=_td, refit_models=("ridge",), progress=lambda p, m: None)
     assert len(uv.read_picks(Path(_td) / "picks.csv")) == 1
+    _kfw = uv.load_kr_factors(Path(_td) / "kr_factors.csv")              # 매주 계산이 한국판 요인도 저장
+    assert list(_kfw.columns) == ["Mkt-RF", "Mom", "RF"] and _kfw.index[-1] == _cw.index[-1]   # 시총·재무가 없는 패널
+
+# ---------------- 한국판 요인 (파마-프렌치 방식의 근사) ----------------
+# 심어 둔 구조: 시가총액이 작을수록, 장부가/시총이 클수록 매일 조금 더 오른다 → 소형주·가치 요인이 양(+)으로 나와야
+_n, _T = 100, 700
+_g = np.random.default_rng(3)
+_size, _val = _g.standard_normal(_n), _g.standard_normal(_n)
+_ret = 0.01 * _g.standard_normal((_T, _n)) - 0.002 * _size + 0.001 * _val
+_codes = [f"{i:06d}" for i in range(_n)]
+_dk = pd.bdate_range("2019-01-02", periods=_T)
+_ck = pd.DataFrame(100 * np.cumprod(1 + _ret, axis=0), index=_dk, columns=_codes)
+_pk = {"close": _ck, "universe": pd.DataFrame(True, index=_dk, columns=_codes),
+       "cap": pd.DataFrame(np.exp(20 + _size)[None, :].repeat(_T, 0), index=_dk, columns=_codes),
+       "feat": {"bm": pd.DataFrame(_val[None, :].repeat(_T, 0), index=_dk, columns=_codes)}}
+_rfk = pd.Series(0.0001, index=_dk)
+_kf = uv.kr_factors(_pk, rf=_rfk)
+assert _kf["SMB"].mean() > 0 and qe.overlap_tstat(_kf["SMB"].dropna().values, 1) > 3
+assert _kf["HML"].mean() > 0 and qe.overlap_tstat(_kf["HML"].dropna().values, 1) > 3
+assert list(_kf.columns) == ["Mkt-RF", "SMB", "HML", "RF"]                  # 데이터가 없는 요인(수익성·모멘텀)은 뺌
+_w = _pk["cap"].iloc[9]                                                      # 시장 = 전날 시가총액 가중 − 무위험 수익률
+assert np.isclose(_kf["Mkt-RF"].iloc[9], (_w * _ck.pct_change().iloc[10]).sum() / _w.sum() - 0.0001)
+assert np.allclose(_kf["RF"], 0.0001)
+# 미래 정보 없음: T 이후 가격을 바꿔도 T까지의 요인 값은 그대로
+_ck2 = _ck.copy()
+_ck2.iloc[401:] *= np.exp(0.05 * _g.standard_normal((_T - 401, _n)))
+_kf2 = uv.kr_factors({**_pk, "close": _ck2}, rf=_rfk)
+assert np.allclose(_kf.loc[:_dk[400]].values, _kf2.loc[:_dk[400]].values, equal_nan=True)
+assert not np.allclose(_kf.loc[_dk[401]:, "SMB"].values, _kf2.loc[_dk[401]:, "SMB"].values, equal_nan=True)
+# 수익 분해에 그대로 들어간다 (French 데이터와 같은 열 이름)
+_lr = np.log1p(_ck.iloc[:, 0].pct_change()).fillna(0.0)
+_pos = pd.Series((np.arange(_T) // 30) % 2, index=_dk, dtype=float)
+_att = qe.timing_attribution(pd.DataFrame({"pos": _pos, "strat": _pos * _lr, "asset": _lr}), _kf)
+assert {"전략 (요인 모형)", "단순 보유 (요인 모형)"} <= set(_att["summary"].index)
+assert {"시장", "소형주", "가치"} <= set(_att["loadings"].index)
 
 # 코스피200: 네이버 차트 XML → 종가 (Yahoo엔 과거 기록이 거의 없음)
 _xml = ('<?xml version="1.0" encoding="EUC-KR" ?><protocol><chartdata symbol="KPI200">'

@@ -246,8 +246,9 @@ def build_panel(top_n=TOP_N, cap_limit=None, end=None):
     F.update(kr_data.value_features(fin, idx, close_raw, cands.set_index("code")["shares"]))
 
     coverage = {k: float(v.where(universe).notna().sum().sum() / max(universe.sum().sum(), 1)) for k, v in F.items()}
+    cap = close_raw * cands.set_index("code")["shares"].reindex(close.columns)     # 시가총액 ≈ 그날 주가 × 현재 상장주식수
     return {"feat": F, "close": close, "universe": universe, "names": cands.set_index("code")["name"],
-            "coverage": coverage}
+            "coverage": coverage, "cap": cap}
 
 
 def _read_cache(name):
@@ -560,6 +561,78 @@ def current_picks(panel, wf, k=20):
     return d, pick, tbl.head(k), tbl.tail(k).iloc[::-1]
 
 
+# ---------------- 한국판 요인 (파마-프렌치 방식의 근사) ----------------
+# 한국 시장 전용 무료 일간 요인 데이터가 없어, 같은 종목 범위(그때의 거래대금 상위 200)로 직접 만든다.
+# 열 이름은 French 데이터와 같게 두어 quant_engine.timing_attribution에 그대로 넣는다 (투자 요인 CMA는 자산 데이터가 없어 뺌).
+KR_FACTORS = {"Mkt-RF": "시장", "SMB": "소형주", "HML": "가치", "RMW": "수익성", "Mom": "모멘텀"}
+KR_FACTOR_SORTS = {"SMB": ("cap", -1), "HML": ("bm", +1), "RMW": ("roe", +1), "Mom": ("mom_12_1", +1)}
+
+
+def kr_factors(panel, rf=None, every=21, q=0.3):
+    """한국판 일간 요인 수익률 (소수). 반환 열: Mkt-RF, SMB, HML, RMW, Mom, RF (데이터가 없는 요인은 빠짐 — 예: DART 키가 없으면 가치·수익성).
+
+    시장: 그 전날 종목 범위의 시가총액 가중 수익률 − 무위험 수익률(rf: 날짜별 '하루' 수익률, 없으면 0).
+    나머지: every거래일마다 그날 값으로 종목을 줄 세워 상위 q − 하위 q (동일 비중)를 다음 리밸런싱까지 들고 있는 수익률.
+    소형주 = 시가총액 하위 − 상위, 가치 = 장부가/시총 상위 − 하위, 수익성 = ROE 상위 − 하위, 모멘텀 = 12-1개월 수익률 상위 − 하위.
+    줄 세우는 날까지의 정보만 쓰고(재무는 공시 다음 거래일부터), 그다음 날부터의 수익률을 번다 → 미래 정보 없음.
+    """
+    close, univ, idx = panel["close"], panel["universe"], panel["close"].index
+    r = close.pct_change(fill_method=None)
+    cap = panel.get("cap")
+    if cap is not None:
+        w = cap.shift(1).where(univ.shift(1, fill_value=False))
+        mkt = (w * r).sum(axis=1, min_count=1) / w.where(r.notna()).sum(axis=1, min_count=1)
+    else:                                                     # 시가총액이 없으면 동일 비중
+        mkt = r.where(univ.shift(1, fill_value=False)).mean(axis=1)
+    rf = (rf.reindex(idx).ffill().fillna(0.0) if rf is not None else pd.Series(0.0, index=idx))
+    out = pd.DataFrame({"Mkt-RF": mkt - rf}, index=idx)
+    src = {"cap": cap, **panel["feat"]}
+    first = int(univ.any(axis=1).values.argmax())
+    rebal = list(range(first, len(idx) - 1, every))
+    for name, (col, sign) in KR_FACTOR_SORTS.items():
+        x = src.get(col)
+        if x is None:
+            continue
+        f = pd.Series(np.nan, index=idx)
+        for j, t in enumerate(rebal):
+            end = rebal[j + 1] if j + 1 < len(rebal) else len(idx) - 1
+            s = x.iloc[t].where(univ.iloc[t].values).dropna()
+            k = int(len(s) * q)
+            if k < 5:
+                continue
+            hi, lo = s.nlargest(k).index, s.nsmallest(k).index
+            long, short = (hi, lo) if sign > 0 else (lo, hi)
+            seg = r.iloc[t + 1:end + 1]
+            f.iloc[t + 1:end + 1] = (seg[long].mean(axis=1) - seg[short].mean(axis=1)).values
+        if f.notna().any():                                   # 데이터가 없는 요인은 열째로 뺀다 (회귀 전체가 비지 않도록)
+            out[name] = f
+    out["RF"] = rf
+    return out.dropna(subset=["Mkt-RF"]).reindex(columns=[c for c in [*KR_FACTORS, "RF"] if c in out])
+
+
+def cd91_daily(start, end=None):
+    """CD 91일 금리(한국은행 ECOS, 연 %) → 날짜별 하루 무위험 수익률 (소수). 키가 없거나 실패하면 None."""
+    try:
+        s = kr_data.ecos_series("817Y002", "010502000", pd.Timestamp(start), pd.Timestamp(end or pd.Timestamp.today()))
+    except Exception:
+        return None
+    return None if s is None or s.empty else s / 100.0 / 252
+
+
+KR_FACTORS_PATH = Path(__file__).parent / "ranking" / "kr_factors.csv"
+
+
+def load_kr_factors(path=KR_FACTORS_PATH):
+    """매주 계산해 둔 한국판 일간 요인 (없으면 None)."""
+    if not Path(path).exists():
+        return None
+    return pd.read_csv(path, index_col="date", parse_dates=["date"])
+
+
+def kr_factors_stamp(path=KR_FACTORS_PATH):
+    return Path(path).stat().st_mtime if Path(path).exists() else None
+
+
 # ---------------- 매주 미리 계산 (GitHub Actions) ----------------
 RANK_DIR = Path(__file__).parent / "ranking"     # 계산 결과만 저장한다 (원본 시세·수급·재무는 올리지 않음)
 RESULTS_PATH = RANK_DIR / "results.pkl"
@@ -664,12 +737,14 @@ def weekly_stamp(path=RESULTS_PATH):
     return Path(path).stat().st_mtime if Path(path).exists() else None
 
 
-def weekly(update=True, panel=None, out_dir=RANK_DIR, now=None, refit_models=("ridge", "gbm"), progress=print, smoke=False):
+def weekly(update=True, panel=None, out_dir=RANK_DIR, now=None, refit_models=("ridge", "gbm"), progress=print, smoke=False,
+           rf=None):
     """GitHub Actions가 매주 돌리는 일 (python universe.py weekly).
 
     ① 데이터 갱신 ② 앱 설정 조합(교체 주기 × 체결 시점 × 증권거래세)마다 탭에 보일 결과를 계산해 results.pkl로 저장
     ③ 이번 추천(앱 기본 설정)을 picks.csv에 미리 적고, 기간이 지난 추천을 채점. 원본 시세·수급·재무는 저장하지 않는다.
-    panel: 테스트용 (주면 데이터를 받지 않고 그 패널로 계산).
+    ④ 한국판 일간 요인(시장·소형주·가치·수익성·모멘텀)을 kr_factors.csv로 저장 — 방향 예측·시장 국면의 수익 분해에 쓴다.
+    panel: 테스트용 (주면 데이터를 받지 않고 그 패널로 계산). rf: 테스트용 무위험 수익률 (없으면 ECOS CD 91일).
     smoke: 코드가 바뀐 푸시에서 쓰는 빠른 점검 — 시총 상위 60종목·4년치로 전체 과정을 실제 데이터로 한 번 돌려 본다."""
     say = (lambda p, m: progress(p, m)) if progress is not print else (lambda p, m: print(f"[{p:4.0%}] {m}", flush=True))
     if panel is None:
@@ -694,6 +769,9 @@ def weekly(update=True, panel=None, out_dir=RANK_DIR, now=None, refit_models=("r
                   "meta": data_info(), "version": version}, out_dir / RESULTS_PATH.name)
     log = score_picks(record_picks(read_picks(out_dir / PICKS_PATH.name), rec, panel, version), panel)
     log.to_csv(out_dir / PICKS_PATH.name, index=False)
+    idx = panel["close"].index
+    kf = kr_factors(panel, rf=cd91_daily(idx[0], idx[-1]) if rf is None else rf)
+    kf.round(7).to_csv(out_dir / KR_FACTORS_PATH.name, index_label="date")      # 계산 결과(요인 수익률)만 저장
     say(1, f"완료: 설정 {len(res)}개, 데이터 {panel['close'].index[-1].date()}까지, 추천 기록 {len(log)}줄")
     return res, log
 
