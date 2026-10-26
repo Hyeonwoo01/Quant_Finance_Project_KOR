@@ -257,6 +257,7 @@ def check():
         print(f"코스피200: 받지 못함 ({type(e).__name__}: {str(e)[:200]})", flush=True)
         ok = False
     import kr_data
+    print("API 키 점검:", key_check(), flush=True)
     try:
         snap = kr_data.krx_daily_all(pd.Timestamp.now(tz="Asia/Seoul").normalize().tz_localize(None) - pd.offsets.BDay(1))
         print(f"KRX 전 종목 시세: {len(snap)}종목, 열 {list(snap.columns)[:12]}", flush=True)
@@ -264,6 +265,47 @@ def check():
     except Exception as e:                     # 아직 필수 아님 (상장폐지 포함 종목 범위를 만들 때 쓸 예정) → 실패해도 점검은 통과
         print(f"KRX 전 종목 시세: 받지 못함 ({type(e).__name__}: {str(e)[:200]})", flush=True)
     return ok
+
+
+def key_check():
+    """API 키가 있는지, 실제로 한 번 불러지는지 (키 값은 출력하지 않는다). 키가 주소에 들어가는 요청의 오류는 종류만 적는다."""
+    import requests
+    import kr_data
+    out, end = {}, pd.Timestamp.today()
+    if kr_data.get_key("DART_API_KEY"):
+        try:
+            out["DART"] = f"정상 (삼성전자 고유번호 {kr_data.dart_corp_code('005930')})"
+        except RuntimeError as e:
+            out["DART"] = f"오류: {str(e)[:120]}"
+        except Exception as e:
+            out["DART"] = f"오류: {type(e).__name__}"
+    else:
+        out["DART"] = "키 없음"
+    if kr_data.get_key("ECOS_API_KEY"):
+        try:
+            s = kr_data.ecos_series("817Y002", kr_data.ECOS_RATES["kr3y"], end - pd.Timedelta(days=14), end)
+            out["ECOS"] = f"정상 (국고채 3년 {s.index[-1].date()} {s.iloc[-1]:.3f}%)"
+        except RuntimeError as e:
+            out["ECOS"] = f"오류: {str(e)[:120]}"
+        except Exception as e:
+            out["ECOS"] = f"오류: {type(e).__name__}"
+    else:
+        out["ECOS"] = "키 없음"
+    key = kr_data.get_key("KRX_API_KEY")
+    if key:                                   # KRX Open API는 키를 머리말(AUTH_KEY)로 보낸다
+        day = (end - pd.offsets.BDay(1)).strftime("%Y%m%d")
+        for name, path in (("파생상품지수(VKOSPI)", "idx/drvprod_dd_trd"), ("옵션 일별", "drv/opt_bydd_trd"),
+                           ("유가증권 일별", "sto/stk_bydd_trd")):
+            try:
+                r = requests.get(f"https://data-dbg.krx.co.kr/svc/apis/{path}", params={"basDd": day},
+                                 headers={"AUTH_KEY": key}, timeout=30)
+                rows = r.json().get("OutBlock_1") if r.ok else None
+                out[f"KRX {name}"] = f"정상 ({len(rows)}행)" if rows else f"{r.status_code} {r.text[:100]!r}"
+            except Exception as e:
+                out[f"KRX {name}"] = f"오류: {type(e).__name__}"
+    else:
+        out["KRX"] = "키 없음"
+    return out
 
 
 if __name__ == "__main__":
