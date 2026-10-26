@@ -1,0 +1,51 @@
+name: validation
+
+# 실제 데이터 검증 보고서: 기록 종목마다 방향 예측·시장 국면 전략을 비용·세금을 뺀 뒤 단순 보유와 비교하고,
+# 하루 VaR 예외 검정, 코스피 종목 고르기 요약까지 validation/README.md·summary.csv로 커밋한다.
+# 매주 토요일(금요일 종목 고르기 계산 뒤) 예약 실행. 관련 코드가 바뀐 푸시에서는 두 종목으로 빠르게 점검만 한다 (저장 없음).
+on:
+  schedule:
+    # UTC 01:23 토 = 한국 토요일 오전 10:23
+    - cron: "23 1 * * 6"
+  workflow_dispatch:
+  push:
+    paths:
+      - validation.py
+      - .github/workflows/validation.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: validation
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 검증 (푸시일 때는 두 종목만)
+        env:
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
+        run: python validation.py ${{ github.event_name == 'push' && '--smoke' || '' }}
+      - name: 결과 커밋
+        if: github.event_name != 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A validation
+          if git diff --cached --quiet; then echo "새 결과 없음"; exit 0; fi
+          git commit -m "실제 데이터 검증 $(date -u +%Y-%m-%d)"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

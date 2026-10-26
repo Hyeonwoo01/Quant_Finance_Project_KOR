@@ -754,4 +754,62 @@ _xml = ('<?xml version="1.0" encoding="EUC-KR" ?><protocol><chartdata symbol="KP
 _nv = md.parse_naver_chart(_xml)
 assert list(_nv.values) == [845.55, 830.25] and _nv.index[0] == pd.Timestamp("2026-10-21")
 assert md.NAVER_INDEX["^KS200"] == "KPI200" and "^KS200" in md.NAVER_FIRST
+# ---------------- 비용: 세율은 실제로 파는 날(판단 + lag 거래일) 기준 ----------------
+_dt = pd.bdate_range("2025-12-26", "2026-01-09")
+_tx = kc.sell_tax_rate(_dt, "KOSPI")                                   # 2025년 0.15% → 2026년 0.20%
+_ps = pd.Series(1.0, index=_dt)
+_ps.loc["2025-12-31":] = 0.0                                           # 12/31에 '팔자'고 판단
+_c0 = kc.trade_cost(_ps, 0.0, _tx, lag=0)                              # 그날 종가에 팔면 2025년 세율
+_c1 = kc.trade_cost(_ps, 0.0, _tx, lag=1)                              # 다음 거래일(1/1 휴장 무시, 달력상 1/1) 종가에 팔면 2026년 세율
+assert np.isclose(_c0.loc["2025-12-31"], 0.0015) and np.isclose(_c1.loc["2025-12-31"], 0.0020)
+assert np.isclose(_c1.sum(), 0.0020) and kc.trade_cost(_ps, 0.0, 0.002, lag=1).sum() == 0.002      # 숫자 세율은 그대로
+
+# ---------------- 블록 부트스트랩 신뢰구간 ----------------
+_gb = np.random.default_rng(0)
+_x = 0.001 + 0.01 * _gb.standard_normal(2000)
+_lo, _hi = qe.block_bootstrap_ci(_x, 1)
+assert _lo < 0.001 < _hi and abs((_hi - _lo) / (2 * 1.96 * 0.01 / np.sqrt(2000)) - 1) < 0.15      # 독립이면 보통 공식과 같은 폭
+_e = _gb.standard_normal(5000)
+_ar = np.zeros(5000)
+for _t in range(1, 5000):
+    _ar[_t] = 0.8 * _ar[_t - 1] + _e[_t]
+_w1 = np.subtract(*qe.block_bootstrap_ci(_ar, 1)[::-1])
+_w50 = np.subtract(*qe.block_bootstrap_ci(_ar, 50)[::-1])
+assert 2.3 < _w50 / _w1 < 3.7                     # 자기상관 0.8이면 이론상 √((1+0.8)/(1−0.8)) = 3배 넓어야
+assert np.isnan(qe.block_bootstrap_ci(_x[:50], 42)[0])                # 표본이 블록 2배보다 짧으면 계산하지 않음
+
+# ---------------- 실제 데이터 검증 보고서 (데이터는 합성으로 바꿔 끼움) ----------------
+import validation as vd
+_orig_v = {k: getattr(md, k) for k in ("load_history", "load_macro", "kr_info")}
+_orig_va = ad.build_alt_features
+_hist = pd.Series(100 * np.exp(np.cumsum(0.0004 + 0.012 * np.random.default_rng(5).standard_normal(1800))),
+                  index=pd.bdate_range("2019-01-02", periods=1800))
+def _hist_or_fail(t, years):
+    if t == "없는종목.KS":
+        raise ValueError("주가 데이터 없음")
+    return _hist
+md.load_history = _hist_or_fail
+md.load_macro = lambda t, years=10: None
+md.kr_info = lambda t: ("테스트전자", "KOSPI", "stock")
+ad.build_alt_features = lambda t, idx: (None, {})
+try:
+    _vr = vd.validate("005930.KS")
+    assert _vr["세금 구분"] == "KOSPI" and _vr["방향 예측력"] in ("있음", "확인 안 됨") and 0 <= _vr["가정 바꿔 통과(7개 중)"] <= 7
+    assert _vr["방향 초과 95% 하한"] <= _vr["방향 초과수익(연)"] <= _vr["방향 초과 95% 상한"]
+    assert _vr["국면 초과 95% 하한"] <= _vr["국면 초과수익(연)"] <= _vr["국면 초과 95% 상한"]
+    assert _vr["방향 전략 경제적 가치"] == ("있음" if _vr["방향 초과 95% 하한"] > 0 else "확인 안 됨")
+    # 같은 데이터로 앱 방향 예측 탭과 같은 숫자 (같은 함수·같은 기본 설정)
+    _wfv, _ = dr.walk_forward(_hist, 21, None, alt=None, ticker="005930.KS")
+    _evv = dr.evaluate(_wfv, 21, np.log(_hist).diff(), 3.0, lag=1, sell_tax=kc.sell_tax_rate(_hist.index, "KOSPI"))
+    assert np.isclose(_vr["방향 z"], _evv["z"]) and np.isclose(_vr["방향 전략 최대 낙폭"], _evv["mdd"])
+    with tempfile.TemporaryDirectory() as _vd:
+        _rows = vd.run(["005930.KS", "없는종목.KS"], out_dir=_vd, say=lambda m: None)
+        _md = (Path(_vd) / "README.md").read_text(encoding="utf-8")
+        assert "테스트전자" in _md and "계산하지 못한 종목" in _md and "없는종목.KS: ValueError" in _md   # 한 종목 실패해도 나머지는 보고
+        _sv = pd.read_csv(Path(_vd) / "summary.csv")
+        assert len(_sv) == 2 and pd.isna(_sv.loc[0, "오류"]) and "주가 데이터 없음" in _sv.loc[1, "오류"]
+finally:
+    for _k, _v in _orig_v.items():
+        setattr(md, _k, _v)
+    ad.build_alt_features = _orig_va
 print("모든 테스트 통과")
