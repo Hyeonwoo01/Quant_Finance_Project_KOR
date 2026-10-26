@@ -770,8 +770,12 @@ def weekly(update=True, panel=None, out_dir=RANK_DIR, now=None, refit_models=("r
     log = score_picks(record_picks(read_picks(out_dir / PICKS_PATH.name), rec, panel, version), panel)
     log.to_csv(out_dir / PICKS_PATH.name, index=False)
     idx = panel["close"].index
-    kf = kr_factors(panel, rf=cd91_daily(idx[0], idx[-1]) if rf is None else rf)
-    kf.round(7).to_csv(out_dir / KR_FACTORS_PATH.name, index_label="date")      # 계산 결과(요인 수익률)만 저장
+    try:                                      # 부가 결과 — 실패해도 위의 종목 고르기 결과는 그대로 커밋되도록
+        kf = kr_factors(panel, rf=cd91_daily(idx[0], idx[-1]) if rf is None else rf)
+        kf.round(7).to_csv(out_dir / KR_FACTORS_PATH.name, index_label="date")  # 계산 결과(요인 수익률)만 저장
+        say(1, f"한국판 요인: {', '.join(KR_FACTORS[c] for c in kf.columns if c in KR_FACTORS)} · {len(kf)}일")
+    except Exception as e:
+        say(1, f"⚠️ 한국판 요인 계산 실패 (다른 결과는 저장됨): {type(e).__name__}: {str(e)[:200]}")
     say(1, f"완료: 설정 {len(res)}개, 데이터 {panel['close'].index[-1].date()}까지, 추천 기록 {len(log)}줄")
     return res, log
 
