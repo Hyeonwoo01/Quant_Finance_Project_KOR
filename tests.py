@@ -669,4 +669,54 @@ _t0, _c0 = uv.evaluate(wf_u, cost_bps=0)
 _t1, _c1 = uv.evaluate(wf_u, cost_bps=0, sell_tax=True)
 _n0 = _c0["auto"]["상위 20% (비용 후)"]; _n1 = _c1["auto"]["상위 20% (비용 후)"]
 assert _n0.iloc[0] == _n1.iloc[0] and (_n1.iloc[1:] < _n0.iloc[1:]).all()
+
+# ---------------- 종목 고르기: 매주 미리 계산(GitHub Actions) + 추천 실전 기록 ----------------
+import tempfile
+_res = uv.results(_pc, wf_u, cost_bps=5.0, sell_tax=True)
+assert _res["table"].equals(uv.evaluate(wf_u, 5.0, sell_tax=True)[0]) and _res["pick"] == wf_u["chosen"].iloc[-1]
+assert _res["risk"] is not None and _res["capacity"] is not None and _res["n_univ"] == int(_pc["universe"].iloc[-1].sum())
+# 장중에 돌리면 '오늘' 봉은 빼고 계산·기록 (한국 15:30 + 여유 40분 전), 마감 뒤·다음 날엔 그대로
+_ix = pd.DatetimeIndex(["2026-10-22", "2026-10-23"])
+assert uv.finished_end(_ix, pd.Timestamp("2026-10-23T03:00Z")) == _ix[0]        # 한국 낮 12시
+assert uv.finished_end(_ix, pd.Timestamp("2026-10-23T08:00Z")) == _ix[1]        # 한국 오후 5시
+assert uv.finished_end(_ix, pd.Timestamp("2026-10-24T01:00Z")) == _ix[1]        # 다음 날
+# 기록 채점: 기록일 다음 거래일 종가에 사서 h거래일 뒤까지, 바구니 vs 그날 종목 범위 전체 (동일 비중)
+_pw = synth_panel(7, n_day=1300)
+_pw["feat"]["liq"] = pd.DataFrame(np.log(1e11), index=_pw["close"].index, columns=_pw["close"].columns)
+_cw, _uw = _pw["close"], _pw["universe"]
+_lg = pd.DataFrame([{"date": str(_cw.index[300].date()), "model": "ridge", "n": 2, "codes": "000001 000002",
+                     "names": "가, 나", "version": ""}]).reindex(columns=uv.PICK_COLUMNS)
+_sg = uv.score_picks(_lg, _pw)
+_g21 = _cw.iloc[301 + 21] / _cw.iloc[301] - 1
+assert np.isclose(_sg["basket_21"].iloc[0], _g21[["000001", "000002"]].mean())
+assert np.isclose(_sg["market_21"].iloc[0], _g21[_uw.columns[_uw.iloc[300].values]].mean())
+_late = _lg.assign(date=str(_cw.index[-30].date()))                              # 63거래일이 아직 안 지난 기록
+_sl = uv.score_picks(_late, _pw)
+assert np.isfinite(_sl["basket_21"].iloc[0]) and np.isnan(_sl["basket_63"].iloc[0])
+_fake = pd.DataFrame({"basket_21": [0.03, 0.01, -0.01, 0.02], "market_21": [0.01] * 4,
+                      "basket_63": [np.nan] * 4, "market_63": [np.nan] * 4})
+_sm = uv.picks_summary(_fake)
+assert _sm.loc["21거래일", "채점 수"] == 4 and np.isclose(_sm.loc["21거래일", "평균 초과수익"], 0.0025)
+assert np.isclose(_sm.loc["21거래일", "전체 평균보다 나은 비율"], 0.5) and _sm.loc["63거래일", "채점 수"] == 0
+# 매주 계산: 앱 설정 조합 8개를 저장하고, 이번 추천을 한 줄 기록. 같은 날 다시 돌려도 기록은 그대로 (미리 적은 기록은 고치지 않음)
+with tempfile.TemporaryDirectory() as _td:
+    _wres, _wlog = uv.weekly(panel=_pw, out_dir=_td, refit_models=("ridge",), progress=lambda p, m: None)
+    assert set(_wres) == {(h, l, t) for h in uv.WEEKLY_HOLDS for l in (1, 0) for t in (True, False)}
+    _saved = uv.load_weekly(Path(_td) / "results.pkl")
+    assert _saved["results"][(63, 1, True)]["table"].equals(_wres[(63, 1, True)]["table"])
+    assert _saved["data_end"] == _cw.index[-1] and _saved["cost_bps"] == uv.WEEKLY_COST
+    _rd = uv.read_picks(Path(_td) / "picks.csv")
+    assert len(_rd) == 1 and _rd["date"].iloc[0] == str(_cw.index[-1].date()) and _rd["codes"].iloc[0].startswith("0")
+    assert int(_rd["n"].iloc[0]) == len(_rd["codes"].iloc[0].split()) > 0
+    assert _rd["codes"].iloc[0].split() == uv.current_basket(uv.walk_forward(_pw, 63, refit_models=("ridge",)))
+    _, _wlog2 = uv.weekly(panel=_pw, out_dir=_td, refit_models=("ridge",), progress=lambda p, m: None)
+    assert len(uv.read_picks(Path(_td) / "picks.csv")) == 1
+
+# 코스피200: 네이버 차트 XML → 종가 (Yahoo엔 과거 기록이 거의 없음)
+_xml = ('<?xml version="1.0" encoding="EUC-KR" ?><protocol><chartdata symbol="KPI200">'
+        '<item data="20261022|846.0|860.0|820.0|830.25|223456" /><item data="20261021|840.1|850.2|830.3|845.55|123456" />'
+        '</chartdata></protocol>')
+_nv = md.parse_naver_chart(_xml)
+assert list(_nv.values) == [845.55, 830.25] and _nv.index[0] == pd.Timestamp("2026-10-21")
+assert md.NAVER_INDEX["^KS200"] == "KPI200" and "^KS200" in md.NAVER_FIRST
 print("모든 테스트 통과")

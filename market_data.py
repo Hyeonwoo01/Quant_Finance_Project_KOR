@@ -15,12 +15,45 @@ from quant_engine import RiskNeutralPricingEngine
 
 
 def load_history(ticker, years):
+    t = ticker.upper()
+    if t in NAVER_FIRST:                 # Yahoo에 과거 데이터가 거의 없는 지수는 네이버를 먼저
+        try:
+            return naver_index_history(t, years)
+        except Exception:
+            pass
     h = yf.Ticker(ticker).history(period=f"{years}y", auto_adjust=True)
-    if h.empty:
+    close = h["Close"].dropna() if not h.empty else pd.Series(dtype=float)
+    if t in NAVER_INDEX and len(close) < 0.3 * 245 * years:      # 한국 지수인데 Yahoo 기록이 너무 짧으면 네이버로
+        try:
+            return naver_index_history(t, years)
+        except Exception:
+            pass
+    if close.empty:
         raise ValueError(f"'{ticker}'의 주가 데이터를 찾을 수 없습니다. 티커를 확인하세요 (예: AAPL, SPY, 005930.KS).")
-    close = h["Close"].dropna()
     close.index = close.index.tz_localize(None)
     return close
+
+
+# 한국 지수의 네이버 차트 기호. 코스피200(^KS200)은 Yahoo가 최근 1개월 요청에 1일치만 줘서(2026-10 점검) 네이버를 먼저 쓴다.
+NAVER_INDEX = {"^KS11": "KOSPI", "^KQ11": "KOSDAQ", "^KS200": "KPI200"}
+NAVER_FIRST = {"^KS200"}
+NAVER_CHART = "https://fchart.stock.naver.com/sise.nhn?symbol={}&timeframe=day&count={}&requestType=0"
+
+
+def parse_naver_chart(text):
+    """네이버 차트 XML의 <item data="날짜|시가|고가|저가|종가|거래량"> → 종가 Series."""
+    rows = [r.split("|") for r in re.findall(r'<item data="([^"]+)"', text)]
+    s = pd.Series([float(r[4]) for r in rows], index=pd.to_datetime([r[0] for r in rows], format="%Y%m%d"), name="Close")
+    return s[s > 0].sort_index()
+
+
+def naver_index_history(ticker, years):
+    r = requests.get(NAVER_CHART.format(NAVER_INDEX[ticker.upper()], int(years * 260) + 30), headers=_UA, timeout=20)
+    r.raise_for_status()
+    s = parse_naver_chart(r.text)
+    if s.empty:
+        raise ValueError(f"네이버 차트에 '{ticker}' 데이터가 없습니다.")
+    return s[s.index > s.index[-1] - pd.DateOffset(years=years)]
 
 
 # 과거 내재변동성 대용: Cboe 변동성 지수 (30일 만기 옵션으로 계산, 지수 포인트 = 연율 %)

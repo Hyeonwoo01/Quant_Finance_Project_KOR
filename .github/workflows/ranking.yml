@@ -1,0 +1,67 @@
+name: ranking
+
+# 매주 금요일 장 마감 뒤 '코스피 종목 고르기'를 계산해 ranking/에 저장한다 → 배포된 앱이 데이터를 받지 않고 바로 보여 준다.
+# 그 주의 추천(상위 20%)은 ranking/picks.csv에 미리 적어 두고, 21·63거래일 뒤 실제 성적을 채점한다 (실전 기록).
+# 원본 시세·수급·재무는 저장소에 올리지 않고(재배포 방지) Actions 캐시에만 둔다 — 다음 실행은 새 날짜만 받는다.
+# 처음 실행은 6년치를 모두 받느라 몇 시간 걸릴 수 있다. 시간 안에 못 끝내도 받은 데이터는 캐시에 남아 다음 실행이 이어 받는다.
+# 예약 실행은 기본 브랜치(main)에서만 돈다. 관련 코드가 바뀐 푸시에서는 시총 상위 60종목·4년치로 빠르게 점검만 한다 (저장 없음).
+on:
+  schedule:
+    # UTC 09:17 금 = 한국 금요일 오후 6:17 (장 마감 15:30 뒤)
+    - cron: "17 9 * * 5"
+  workflow_dispatch:
+  push:
+    paths:
+      - universe.py
+      - .github/workflows/ranking.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ranking
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"        # 진행 상황을 바로바로 로그에 (중간에 끊겨도 어디까지 했는지 보이게)
+
+jobs:
+  ranking:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 받아 둔 시세·수급 불러오기 (Actions 캐시)
+        if: github.event_name != 'push'
+        uses: actions/cache/restore@v4
+        with:
+          path: cache
+          key: universe-${{ github.run_id }}
+          restore-keys: universe-
+      - name: 데이터 갱신 + 계산 (푸시일 때는 빠른 점검)
+        timeout-minutes: 300
+        env:
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
+        run: python universe.py weekly ${{ github.event_name == 'push' && '--smoke' || '' }}
+      - name: 받은 데이터 저장 (계산이 실패하거나 시간이 넘어도 다음 실행이 이어 받도록)
+        if: always() && github.event_name != 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: cache
+          key: universe-${{ github.run_id }}
+      - name: 결과 커밋
+        if: success() && github.event_name != 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A ranking
+          if git diff --cached --quiet; then echo "새 결과 없음"; exit 0; fi
+          git commit -m "종목 고르기 결과 $(date -u +%Y-%m-%d)"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

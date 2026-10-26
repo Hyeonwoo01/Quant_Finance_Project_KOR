@@ -211,21 +211,13 @@ def get_universe(h, cost_bps, data_stamp, lag, use_tax):
     """data_stamp: 데이터 갱신 시각 — 새로 받으면 다시 계산되도록 캐시 키에 넣는다. lag: 체결 시점(거래일)."""
     panel = uv.build_panel()
     wf = uv.walk_forward(panel, h, exec_lag=lag)
-    table, curves = uv.evaluate(wf, cost_bps, sell_tax=use_tax)
-    d, pick, top, bottom = uv.current_picks(panel, wf)
-    n_univ = int(panel["universe"].iloc[-1].sum())
-    return {"table": table, "curves": curves, "ic": wf["ic"]["auto"], "chosen": wf["chosen"], "date": d,
-            "pick": pick, "top": top, "bottom": bottom, "coverage": panel["coverage"], "cols": wf["cols"],
-            "n_univ": n_univ, "factors": uv.factor_exposure(wf, curves), "selection": uv.selection_check(curves, h),
-            "capacity": _optional(uv.capacity, wf, panel, curves), "risk": _optional(lambda: uv.basket_risk(panel, uv.current_basket(wf)))}
+    return uv.results(panel, wf, cost_bps, use_tax)
 
 
-def _optional(fn, *args):
-    """부가 분석은 실패해도 탭 전체를 막지 않는다 (데이터 열이 빠진 경우 등) → None."""
-    try:
-        return fn(*args)
-    except Exception:
-        return None
+@st.cache_data(show_spinner=False)
+def get_weekly(stamp):
+    """GitHub Actions가 매주 계산해 둔 결과와 추천 기록. stamp: 결과 파일 시각 — 새 결과가 오면 다시 읽도록 캐시 키에 넣는다."""
+    return uv.load_weekly(), uv.read_picks()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -601,6 +593,7 @@ with tab_pick:
                "한 종목의 방향 대신, 코스피 대형주 약 200개를 서로 비교해 순위를 매깁니다. "
                "사이드바의 종목 설정과 무관하게 동작합니다.")
     info = uv.data_info()
+    weekly, picks = get_weekly(uv.weekly_stamp())
 
     def run_update():
         bar = st.progress(0.0, text="시작…")
@@ -608,27 +601,43 @@ with tab_pick:
         st.cache_data.clear()
         st.rerun()
 
-    if info is None:
-        st.info("아직 데이터가 없습니다. 처음 받을 때 코스피 전 종목 주가와, 한 번이라도 200위 안에 든 종목의 "
-                "6년치 수급·실적·공시·재무제표를 받느라 **20~40분** 걸립니다. "
-                "(터미널에서 `python universe.py update`로 받아도 됩니다.)")
+    download_note = ("처음 받을 때 코스피 전 종목 주가와, 한 번이라도 200위 안에 든 종목의 "
+                     "6년치 수급·실적·공시·재무제표를 받느라 **20~40분** 걸립니다. "
+                     "(터미널에서 `python universe.py update`로 받아도 됩니다.)")
+    if info is None and weekly is None:
+        st.info("아직 데이터가 없습니다. " + download_note)
         if st.button("데이터 받기", type="primary"):
             run_update()
     else:
-        c1, c2, c3 = st.columns([2, 1, 1])
-        c1.caption(f"데이터 갱신: {info['updated']} · 코스피 {info.get('n_all', '?')}종목 중 "
-                   f"과거 200위 이내 진입 {info['n']}종목 · {info['years']}년")
-        hold = c2.selectbox("종목 교체 주기", [63, 21], format_func=lambda x: f"{x}거래일 (≈{x // 21}개월)")
-        pick_cost = c3.number_input("수수료·체결 비용 (매수·매도 각각, bp)", 0.0, 100.0, 5.0, 1.0,
-                                    help="수수료 + 호가 차이·시장 충격. 증권거래세는 사이드바 설정에 따라 판 비중만큼 연도별 세율로 따로 뺍니다.")
-        if st.button("데이터 업데이트 (새 날짜만 받음)"):
-            run_update()
-        try:
-            with st.spinner("과거 시점마다 모델을 학습·검증하는 중… (처음 1~3분)"):
-                U = get_universe(hold, pick_cost, info["updated"], exec_lag, use_tax)
-        except Exception as e:
-            st.error(f"계산 실패: {e}")
-            U = None
+        U = None
+        if info is None:                 # 이 컴퓨터엔 데이터가 없음 → GitHub Actions가 매주 계산해 둔 결과
+            c1, c2 = st.columns([3, 1])
+            meta = weekly.get("meta") or {}
+            span = f"코스피 {meta['n_all']}종목 중 과거 200위 이내 진입 {meta['n']}종목 · " if "n_all" in meta and "n" in meta else ""
+            c1.caption(f"GitHub Actions가 매주 장 마감 뒤 계산해 둔 결과 · 데이터 {weekly['data_end'].date()}까지 "
+                       f"(계산 {weekly['updated']}) · {span}수수료·체결 비용 {weekly['cost_bps']:g}bp (매수·매도 각각)")
+            hold = c2.selectbox("종목 교체 주기", [63, 21], format_func=lambda x: f"{x}거래일 (≈{x // 21}개월)")
+            U = weekly["results"].get((hold, exec_lag, use_tax))
+            if U is None:
+                st.warning("이 설정 조합의 미리 계산된 결과가 없습니다. 아래에서 데이터를 받아 직접 계산하세요.")
+            with st.expander("수수료를 바꿔 직접 계산하려면"):
+                st.caption("이 컴퓨터에 데이터를 받으면 수수료를 바꿔 가며 바로 계산합니다. " + download_note)
+                if st.button("데이터 받기"):
+                    run_update()
+        else:
+            c1, c2, c3 = st.columns([2, 1, 1])
+            c1.caption(f"데이터 갱신: {info['updated']} · 코스피 {info.get('n_all', '?')}종목 중 "
+                       f"과거 200위 이내 진입 {info['n']}종목 · {info['years']}년")
+            hold = c2.selectbox("종목 교체 주기", [63, 21], format_func=lambda x: f"{x}거래일 (≈{x // 21}개월)")
+            pick_cost = c3.number_input("수수료·체결 비용 (매수·매도 각각, bp)", 0.0, 100.0, 5.0, 1.0,
+                                        help="수수료 + 호가 차이·시장 충격. 증권거래세는 사이드바 설정에 따라 판 비중만큼 연도별 세율로 따로 뺍니다.")
+            if st.button("데이터 업데이트 (새 날짜만 받음)"):
+                run_update()
+            try:
+                with st.spinner("과거 시점마다 모델을 학습·검증하는 중… (처음 1~3분)"):
+                    U = get_universe(hold, pick_cost, info["updated"], exec_lag, use_tax)
+            except Exception as e:
+                st.error(f"계산 실패: {e}")
 
         if U is not None:
             auto = U["table"].loc["auto"]
@@ -661,6 +670,28 @@ with tab_pick:
                        f"전체 종목 평균 {max_drawdown(cv['_universe']):.0%}. "
                        "리밸런싱 시점 기준이라 그 사이에 잠깐 더 빠졌던 하락은 덜 잡힙니다. "
                        f"종목을 고른 날의 데이터로 순위를 매기고 {exec_word}에 사고판다고 봤습니다.")
+
+            if len(picks):
+                st.markdown("**실전 기록** — 매주 장 마감 뒤 GitHub Actions가 그 주의 상위 20% 종목을 미리 적어 두고, "
+                            "21·63거래일 뒤 실제 성적을 채점합니다 (교체 주기 63거래일 · 다음 날 종가에 산다고 보고 · 비용 전).")
+                sm = uv.picks_summary(picks)
+                if sm["채점 수"].sum() == 0:
+                    st.caption(f"기록 {len(picks)}번 (첫 기록 {picks['date'].iloc[0]}). 아직 채점된 기록이 없습니다 — "
+                               "첫 채점은 첫 기록에서 21거래일 뒤입니다.")
+                else:
+                    st.dataframe(sm.style.format({"채점 수": "{:.0f}", "평균 초과수익": "{:+.2%}", "전체 평균보다 나은 비율": "{:.0%}",
+                                                  "t값 (겹침 보정)": _signed(1)}, na_rep="—"), width="stretch")
+                    st.caption("초과수익 = 고른 종목(동일 비중) − 그날 종목 범위 전체 평균. 결과를 모르는 상태에서 적어 둔 기록이라 "
+                               "과거 검증보다 정직한 성적표입니다. 매주 기록해 기간이 겹치므로 t값은 겹침을 보정했고, 2를 넘어야 우연이 아니라고 봅니다.")
+                with st.expander(f"기록 보기 ({len(picks)}번)"):
+                    rec = pd.DataFrame({"기록일": picks["date"],
+                                        "순위 모델": picks["model"].map(lambda m: uv.MODEL_LABELS.get(m, "고르지 않음 → 고정 가중 순위")),
+                                        "종목 수": pd.to_numeric(picks["n"], errors="coerce"),
+                                        **{f"{h}거래일 초과수익": pd.to_numeric(picks[f"basket_{h}"], errors="coerce")
+                                           - pd.to_numeric(picks[f"market_{h}"], errors="coerce") for h in uv.SCORE_HORIZONS},
+                                        "종목": picks["names"]}).iloc[::-1]
+                    st.dataframe(rec.style.format({"종목 수": "{:.0f}", **{f"{h}거래일 초과수익": "{:+.2%}" for h in uv.SCORE_HORIZONS}},
+                                                  na_rep="—"), hide_index=True, width="stretch")
 
             st.markdown("**모델 비교** — 모두 같은 조건으로 시험했습니다. 이 표를 보고 나중에 1등을 고르면 성적이 부풀려지므로, "
                         "앱은 매 시점 그때까지의 성적만 보고 고른 **자동 선택**을 씁니다.")

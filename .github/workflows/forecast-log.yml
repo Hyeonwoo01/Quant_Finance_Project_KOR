@@ -36,6 +36,7 @@ jobs:
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
           ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
+          KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
         run: python forecast_log.py ${{ github.event_name == 'push' && 'check' || 'record' }}
       - name: 기록 커밋
         if: github.event_name != 'push'
