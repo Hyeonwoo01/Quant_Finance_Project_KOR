@@ -295,7 +295,8 @@ def key_check():
     if key:                                   # KRX Open API는 키를 머리말(AUTH_KEY)로 보낸다
         day = (end - pd.offsets.BDay(1)).strftime("%Y%m%d")
         for name, path in (("파생상품지수(VKOSPI)", "idx/drvprod_dd_trd"), ("옵션 일별", "drv/opt_bydd_trd"),
-                           ("유가증권 일별", "sto/stk_bydd_trd")):
+                           ("주식옵션 일별(유가)", "drv/eqsop_bydd_trd"), ("주식옵션 일별(코스닥)", "drv/eqkop_bydd_trd"),
+                           ("유가증권 일별", "sto/stk_bydd_trd"), ("코스닥 일별", "sto/ksq_bydd_trd")):
             try:
                 r = requests.get(f"https://data-dbg.krx.co.kr/svc/apis/{path}", params={"basDd": day},
                                  headers={"AUTH_KEY": key}, timeout=30)
