@@ -316,7 +316,7 @@ def evaluate(wf, h, daily_returns, cost_bps=0.0, threshold=0.5, lag=1, sell_tax=
 
     pos = (wf["auto"] > threshold).astype(float)
     nxt = daily_returns.shift(-(1 + lag)).reindex(wf.index).fillna(0.0)    # t일 판단 → t+lag일 종가 체결 이후 수익률
-    strat = pos * nxt - trade_cost(pos, cost_bps, sell_tax)
+    strat = pos * nxt - trade_cost(pos, cost_bps, sell_tax, lag)        # 비용은 체결 뒤 첫 수익과 같은 행, 세율은 체결일 기준
     equity = pd.DataFrame({"전략": np.exp(strat.cumsum()), "단순 보유": np.exp(nxt.cumsum())}, index=wf.index)
     ann = lambda x: (x.mean() * 252, x.std() * np.sqrt(252))
     (sm, ss), (bm, bs) = ann(strat), ann(nxt)

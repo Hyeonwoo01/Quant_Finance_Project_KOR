@@ -48,11 +48,15 @@ def sell_tax_rate(dates, kind):
     return pd.Series(np.where(pos >= 0, rates[np.maximum(pos, 0)], rates[0]), index=idx)
 
 
-def trade_cost(pos, cost_bps=0.0, sell_tax=0.0):
-    """보유 비중 변화 → 날짜별 비용 (소수, 수익률에서 뺄 값).
+def trade_cost(pos, cost_bps=0.0, sell_tax=0.0, lag=0):
+    """보유 비중 변화 → 날짜별 비용 (소수, 수익률에서 뺄 값). pos의 각 행은 '판단한 날'.
 
-    사고팔 때 각각 cost_bps(수수료·체결 비용), 줄인 비중에는 그날의 매도 세율을 더 낸다.
-    sell_tax: 숫자 또는 날짜별 Series (sell_tax_rate)."""
+    사고팔 때 각각 cost_bps(수수료·체결 비용), 줄인 비중에는 매도 세율을 더 낸다.
+    sell_tax: 숫자 또는 날짜별 Series (sell_tax_rate, 거래일 전체 날짜). lag: 판단 → 실제 체결까지 거래일 수 —
+    세율은 실제로 파는 날(판단 + lag 거래일)의 것을 쓴다 (세율이 바뀌는 1월 1일 앞뒤에서 차이가 난다)."""
     d = pos.diff().fillna(pos.iloc[0])
-    tax = sell_tax.reindex(pos.index).ffill().fillna(0.0) if isinstance(sell_tax, pd.Series) else sell_tax
+    if isinstance(sell_tax, pd.Series):
+        tax = sell_tax.shift(-lag).ffill().reindex(pos.index).ffill().fillna(0.0)
+    else:
+        tax = sell_tax
     return d.abs() * cost_bps * 1e-4 + (-d).clip(lower=0) * tax

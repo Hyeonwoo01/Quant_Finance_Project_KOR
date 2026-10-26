@@ -118,7 +118,7 @@ section[data-testid="stSidebar"] hr {{ margin: 12px 0; }}
 [data-testid="stAlertContentError"], [data-testid="stAlertContentError"] * {{ color: {REJECT} !important; }}
 
 /* 카드형 컨테이너: 차트·표·확장 영역 */
-[data-testid="stPlotlyChart"] {{ background: {CANVAS}; border: 1px solid {HAIRLINE}; border-radius: 18px; padding: 12px 8px 4px; box-sizing: border-box; overflow: hidden; }}
+[data-testid="stPlotlyChart"] {{ background: {CANVAS}; border: 1px solid {HAIRLINE}; border-radius: 18px; padding: 0 8px; box-sizing: border-box; overflow: hidden; }}
 [data-testid="stDataFrame"] {{ background: {CANVAS}; border: 1px solid {HAIRLINE}; border-radius: 18px; overflow: hidden; box-sizing: border-box; }}
 [data-testid="stExpander"] details {{ background: {CANVAS}; border-radius: 18px; border: 1px solid {HAIRLINE}; }}
 [data-testid="stExpander"] summary {{ padding: 14px 20px; }}
@@ -249,8 +249,9 @@ def verdict(eyebrow, head, unit="", tags=(), desc=""):
 
 
 def chart(fig):
-    """Plotly 차트를 흰 카드에. 배경은 템플릿이 아니라 그림에 직접 넣어야 Streamlit이 바꾸지 않는다."""
-    fig.update_layout(paper_bgcolor=CANVAS, plot_bgcolor=CANVAS)
+    """Plotly 차트를 흰 카드에. 배경은 템플릿이 아니라 그림에 직접 넣어야 Streamlit이 바꾸지 않는다.
+    오른쪽 여백은 최소 36px — 가로축 마지막 눈금 글자(예: 'Jan 2027')가 가운데 정렬이라 오른쪽 끝에서 잘리지 않도록."""
+    fig.update_layout(paper_bgcolor=CANVAS, plot_bgcolor=CANVAS, margin_r=max(fig.layout.margin.r or 0, 36))
     st.plotly_chart(fig, width="stretch", theme=None)
 
 

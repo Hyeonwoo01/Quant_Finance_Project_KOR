@@ -365,6 +365,8 @@ def evaluate(wf, cost_bps=15.0, q=5, sell_tax=False):
     dates = [d for d in wf["rebal"] if known.loc[d]]
     ret = np.exp(fwd.loc[dates]) - 1
     uni = ret.where(univ.loc[dates]).mean(axis=1)
+    ix = np.minimum(univ.index.get_indexer(dates) + wf.get("exec_lag", 0), len(univ.index) - 1)
+    exec_dates = univ.index[ix]                                              # 실제로 사고파는 날 (세율은 이날 기준)
     for m, S in wf["scores"].items():
         top_r, bot_r, turn, prev = [], [], [], None
         for d in dates:
@@ -383,7 +385,7 @@ def evaluate(wf, cost_bps=15.0, q=5, sell_tax=False):
         turn_s = pd.Series(turn, index=dates)
         net = top - turn_s * 2 * cost_bps * 1e-4                            # 판 만큼 사고 → 양방향 비용
         if sell_tax:                                                         # 첫 매수 때는 판 것이 없음
-            net -= turn_s.where(turn_s.index != dates[0], 0.0) * sell_tax_rate(dates, "KOSPI").values
+            net -= turn_s.where(turn_s.index != dates[0], 0.0) * sell_tax_rate(exec_dates, "KOSPI").values
         ex = net - uni
         icm = wf["ic"][m].loc[dates].dropna()
         per_year = 252 / h

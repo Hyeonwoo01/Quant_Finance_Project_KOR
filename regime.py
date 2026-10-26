@@ -116,7 +116,7 @@ def evaluate(p_high, r, cost_bps=0.0, threshold=0.5, lag=1, sell_tax=0.0):
     pos = (p_high[known] < threshold).astype(float)
     nxt = r.shift(-(1 + lag)).reindex(pos.index).fillna(0.0)
     turnover = pos.diff().abs().fillna(pos.iloc[0])
-    strat = pos * nxt - trade_cost(pos, cost_bps, sell_tax)          # 사고팔 때 수수료, 팔 때 증권거래세
+    strat = pos * nxt - trade_cost(pos, cost_bps, sell_tax, lag)     # 사고팔 때 수수료, 팔 때 증권거래세 (체결일 세율)
     equity = pd.DataFrame({"불안 국면엔 현금": np.exp(strat.cumsum()), "단순 보유": np.exp(nxt.cumsum())})
 
     def stats(x, eq):

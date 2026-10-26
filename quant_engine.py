@@ -397,6 +397,28 @@ def overlap_tstat(x, h):
     return float(x.mean() / se) if se > 1e-15 else 0.0
 
 
+def block_bootstrap_ci(x, block, n_boot=2000, level=0.95, seed=0):
+    """평균의 원형 블록 부트스트랩 신뢰구간 (lo, hi).
+
+    날마다 이어지는 수익률은 서로 상관돼 있어(포지션이 며칠씩 유지되고 변동성이 몰려 다님) 하루하루를 따로 뽑으면
+    신뢰구간이 너무 좁아진다. 길이 block의 연속 구간을 통째로(끝은 처음과 이어 붙여) 다시 뽑아 그 상관을 보존한다.
+    겹침 보정 t값(Hansen-Hodrick)과 다른 방식으로 같은 질문 — '평균이 0보다 크다고 할 수 있나' — 을 다시 확인하는 용도.
+    표본이 block의 2배보다 짧으면 (nan, nan).
+    """
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    n, block = len(x), max(int(block), 1)
+    if n < 2 * block:
+        return np.nan, np.nan
+    rng = np.random.default_rng(seed)
+    k = -(-n // block)                                       # 올림
+    starts = rng.integers(0, n, size=(n_boot, k))
+    idx = ((starts[:, :, None] + np.arange(block)) % n).reshape(n_boot, -1)[:, :n]
+    means = x[idx].mean(axis=1)
+    a = (1 - level) / 2
+    return float(np.quantile(means, a)), float(np.quantile(means, 1 - a))
+
+
 def ols(y, X, hac_lags=0):
     """최소제곱 회귀 (상수항 자동 추가) + 이분산·자기상관에 강한 t값.
 
