@@ -102,13 +102,13 @@ def _parallel(fn, items, workers, progress, label):
     return res
 
 
-def update_data(years=YEARS, workers=4, progress=print):
+def update_data(years=YEARS, workers=4, progress=print, limit=None):
     """코스피 전 종목 주가 → 한 번이라도 200위 안에 든 종목만 수급·실적·공시·재무를 받아 캐시에 저장.
-    종목별 캐시라 두 번째부터는 새 데이터만 받는다."""
+    종목별 캐시라 두 번째부터는 새 데이터만 받는다. limit: 시총 상위 limit개만 (빠른 점검용)."""
     UDIR.mkdir(parents=True, exist_ok=True)
-    say = (lambda p, m: progress(p, m)) if progress is not print else (lambda p, m: print(f"[{p:4.0%}] {m}"))
-    say(0, "코스피 전 종목 목록")
-    cands = fetch_candidates()
+    say = (lambda p, m: progress(p, m)) if progress is not print else (lambda p, m: print(f"[{p:4.0%}] {m}", flush=True))
+    say(0, "코스피 전 종목 목록" if limit is None else f"코스피 시총 상위 {limit}종목 목록 (빠른 점검)")
+    cands = fetch_candidates(limit)
     cands.to_pickle(UDIR / "candidates.pkl")
     tickers = [c + ".KS" for c in cands["code"]]
 
@@ -664,16 +664,17 @@ def weekly_stamp(path=RESULTS_PATH):
     return Path(path).stat().st_mtime if Path(path).exists() else None
 
 
-def weekly(update=True, panel=None, out_dir=RANK_DIR, now=None, refit_models=("ridge", "gbm"), progress=print):
+def weekly(update=True, panel=None, out_dir=RANK_DIR, now=None, refit_models=("ridge", "gbm"), progress=print, smoke=False):
     """GitHub Actions가 매주 돌리는 일 (python universe.py weekly).
 
     ① 데이터 갱신 ② 앱 설정 조합(교체 주기 × 체결 시점 × 증권거래세)마다 탭에 보일 결과를 계산해 results.pkl로 저장
     ③ 이번 추천(앱 기본 설정)을 picks.csv에 미리 적고, 기간이 지난 추천을 채점. 원본 시세·수급·재무는 저장하지 않는다.
-    panel: 테스트용 (주면 데이터를 받지 않고 그 패널로 계산)."""
+    panel: 테스트용 (주면 데이터를 받지 않고 그 패널로 계산).
+    smoke: 코드가 바뀐 푸시에서 쓰는 빠른 점검 — 시총 상위 60종목·4년치로 전체 과정을 실제 데이터로 한 번 돌려 본다."""
     say = (lambda p, m: progress(p, m)) if progress is not print else (lambda p, m: print(f"[{p:4.0%}] {m}", flush=True))
     if panel is None:
         if update:
-            update_data(progress=progress)
+            update_data(years=4 if smoke else YEARS, progress=progress, limit=60 if smoke else None)
         prices = pd.read_pickle(UDIR / "prices.pkl")
         panel = build_panel(end=finished_end(prices["close"].index, now))
     out_dir = Path(out_dir)
@@ -704,8 +705,8 @@ if __name__ == "__main__":
         update_data()
     elif cmd == "financials":          # DART 재무제표만 (차단 등으로 실패했을 때)
         update_financials()
-    elif cmd == "weekly":              # GitHub Actions (.github/workflows/ranking.yml)
-        weekly()
+    elif cmd == "weekly":              # GitHub Actions (.github/workflows/ranking.yml). --smoke: 빠른 점검
+        weekly(smoke="--smoke" in sys.argv)
     else:
         print("사용법: python universe.py update | financials | weekly")
     print(f"총 {time.time() - t0:.0f}초")
