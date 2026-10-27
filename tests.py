@@ -274,6 +274,13 @@ assert tab.loc["composite", "평균 IC"] > 0.05            # 고정 가중도 (�
 _cs, _be = uv.cost_sensitivity(wf_u)
 assert _cs["초과수익(연, 비용후)"].is_monotonic_decreasing and _be > 0
 assert abs(uv.evaluate(wf_u, _be, models=["auto"])[0].loc["auto", "상위20% 초과수익(연, 비용후)"]) < 1e-9
+# 최근 구간을 뺀 성적: 보유 기간이 그 전에 끝난 리밸런싱만, 그 기간들의 초과수익 평균과 같다
+_cv0 = uv.evaluate(wf_u, 5)[1]
+_dr = uv.drop_recent(wf_u, _cv0, days=150)
+_exu = (uv._period_returns(_cv0["auto"]["상위 20% (비용 후)"]) - uv._period_returns(_cv0["_universe"])).dropna()
+_ixu = wf_u["universe"].index
+_kp = [d for d in _exu.index if _ixu.get_loc(d) + 21 + 1 <= len(_ixu) - 1 - 150]
+assert _dr["리밸런싱 수"] == len(_kp) < len(_exu) and np.isclose(_dr["초과수익(연)"], _exu[_kp].mean() * 252 / 21)
 # 시장 구간별: 기간을 범위 평균 수익률 3분위로 나눔 (모든 기간이 한 번씩)
 _mb = uv.market_breakdown(uv.evaluate(wf_u, 5)[1])
 assert list(_mb.index) == ["하락", "횡보", "상승"] and _mb["기간 수"].sum() == tab.loc["auto", "리밸런싱 수"]
@@ -1077,12 +1084,20 @@ try:
     _wfv, _ = dr.walk_forward(_hist, 21, None, alt=None, ticker="005930.KS")
     _evv = dr.evaluate(_wfv, 21, np.log(_hist).diff(), 3.0, lag=1, sell_tax=kc.sell_tax_rate(_hist.index, "KOSPI"))
     assert np.isclose(_vr["방향 z"], _evv["z"]) and np.isclose(_vr["방향 전략 최대 낙폭"], _evv["mdd"])
+    # 최근 1년을 뺀 재채점 = 마지막 1년을 지우고 처음부터 다시 돌린 것과 같다 (워크포워드라 그 전 예측은 이후 데이터와 무관)
+    _cut = _hist.index[-uv.RECENT_DAYS - 1]
+    assert _vr["[최근1년 제외] 끝"] == str(_cut.date())
+    _wfc2, _ = dr.walk_forward(_hist.loc[:_cut], 21, None, alt=None, ticker="005930.KS")
+    _evc2 = dr.evaluate(_wfc2, 21, np.log(_hist.loc[:_cut]).diff(), 3.0, lag=1, sell_tax=kc.sell_tax_rate(_hist.index, "KOSPI"))
+    assert np.isclose(_vr["[최근1년 제외] 방향 z"], _evc2["z"]) and np.isclose(_vr["[최근1년 제외] 확률 정확도"], _evc2["skill"])
+    assert np.isfinite(_vr["분위수 손실 비율 앞 절반"]) and np.isfinite(_vr["분위수 손실 비율 뒤 절반"])
     with tempfile.TemporaryDirectory() as _vd:
         _rows = vd.run(["005930.KS", "없는종목.KS"], out_dir=_vd, say=lambda m: None)
         _md = (Path(_vd) / "README.md").read_text(encoding="utf-8")
         assert "테스트전자" in _md and "계산하지 못한 종목" in _md and "없는종목.KS: ValueError" in _md   # 한 종목 실패해도 나머지는 보고
         assert "## 21일 분할 보유 전략" in _md and "## 예측 확률 구간별 실제 21일 수익" in _md and "## 하루 VaR·ES 검정" in _md
-        assert "## 하루 VaR 꼬리 분포 비교" in _md and "판정:" in _md
+        assert "## 하루 VaR 꼬리 분포 비교" in _md and "판정:" in _md and "앞 절반" in _md
+        assert "## 최근 1년(이례적 급등락 구간)을 뺀 결과" in _md
         _sv = pd.read_csv(Path(_vd) / "summary.csv")
         assert len(_sv) == 2 and pd.isna(_sv.loc[0, "오류"]) and "주가 데이터 없음" in _sv.loc[1, "오류"]
 finally:

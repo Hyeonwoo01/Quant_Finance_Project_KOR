@@ -550,6 +550,27 @@ def cost_sensitivity(wf, costs=(0.0, 5.0, 10.0, 20.0, 40.0), sell_tax=False, mod
     return tab, breakeven
 
 
+RECENT_DAYS = 252          # '최근 1년(이례적 구간)을 뺀' 점검에서 빼는 거래일 수 (EXPERIMENTS.md 사전 등록)
+
+
+def drop_recent(wf, curves, model="auto", days=RECENT_DAYS):
+    """마지막 days거래일이 없었다고 보고 다시 잰 성적: 보유 기간(체결 지연 포함)이 그 전에 끝난 리밸런싱만 쓴다.
+    워크포워드라 그 전의 점수는 이후 데이터와 무관하다 → 마지막 1년을 지우고 다시 돌린 것과 같다. 보고용."""
+    idx = wf["universe"].index
+    cut = len(idx) - 1 - days
+    if cut <= 0:
+        return None
+    lag = wf.get("exec_lag", 0)
+    ex = (_period_returns(curves[model]["상위 20% (비용 후)"]) - _period_returns(curves["_universe"])).dropna()
+    keep = [d for d in ex.index if idx.get_loc(d) + wf["h"] + lag <= cut]
+    if len(keep) < 3:
+        return None
+    x, ic = ex.reindex(keep), wf["ic"][model].reindex(keep).dropna()
+    return {"끝": idx[cut], "리밸런싱 수": len(keep), "초과수익(연)": float(x.mean() * 252 / wf["h"]),
+            "초과수익 t값": hac_tstat(x.values), "평균 IC": float(ic.mean()) if len(ic) else np.nan,
+            "IC t값": hac_tstat(ic.values)}
+
+
 def market_breakdown(curves, model="auto"):
     """리밸런싱 기간을 그 기간 종목 범위 평균 수익률의 3분위(하락·횡보·상승)로 나눠, 구간별 상위 20%(비용 후)의 초과수익.
     특정 시장에서만 벌었는지(예: 상승장에서만) 본다."""
@@ -848,6 +869,7 @@ def results(panel, wf, cost_bps=WEEKLY_COST, sell_tax=False):
             "risk_weighted": rw.loc["auto"] if "auto" in rw.index else None,
             "cost_sens": _optional(cost_sensitivity, wf, sell_tax=sell_tax),
             "market": _optional(market_breakdown, curves),
+            "ex_recent": _optional(drop_recent, wf, curves),
             "switches": int((ch != ch.shift()).iloc[1:].sum()) if len(ch) > 1 else 0}
 
 
