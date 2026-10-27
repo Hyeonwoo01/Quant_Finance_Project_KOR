@@ -474,6 +474,8 @@ LR_{\text{POF}} = -2\ln\frac{(1-p)^{n-x}p^{x}}{(1-\hat\pi)^{n-x}\hat\pi^{x}} \si
 
 시뮬레이션(하락 쪽 꼬리가 1.4배 두꺼운 t(5) 충격의 GARCH, 1,500일)에서 대칭 t는 95% VaR를 넘은 날 6.6%(기각), FHS는 5.1%(통과)였습니다.
 어느 쪽을 기본으로 쓸지는 결과를 보기 전에 [EXPERIMENTS.md](EXPERIMENTS.md)에 적은 규칙(35종목 분위수 손실 비율의 중앙값, 검정 통과 수)으로 정합니다.
+**실제 35종목 결과(2026-10-27): 규칙 미충족 → t분포 유지.** 분위수 손실 비율 중앙값 1.004, VaR 검정 통과 19 → 15, ES 31 → 28.
+지수는 FHS가 조금 나았지만(코스피 95% 예외 7.0% → 6.1%) 여전히 기각이고, 개별 종목은 750개 잔차로 정하는 99% 분위수가 흔들려 예외가 늘었습니다.
 코드: `GarchVolForecaster.tail`, `simulate(innov=)`, `var_backtest(innov=)`, `VAR_INNOV` (`quant_engine.py`), `var_tail_rule` (`validation.py`).
 
 ### ES 검정 (예외일 손실의 크기)
