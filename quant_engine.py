@@ -115,6 +115,7 @@ class GarchVolForecaster:
         self.warnings = []       # 경계값에 닿은 추정 등 사용자에게 알릴 내용
         self.nll = np.nan        # 음의 로그우도 (같은 데이터·분포끼리 비교용, % 단위 스케일 상수 제외)
         self.fit_info = {}       # 최적화 진단: 시작값 수, 수렴 수, 시작값별 우도 차이, 경계에 닿은 계수
+        self.std_resid = np.array([])   # 적합 구간의 표준화 잔차 ε/σ (FHS: 실제 꼬리 분포로 VaR·ES·시뮬레이션)
 
     # 최적화가 실패했을 때 쓰는 보수적인 기본값 (주식 일간 수익률에서 흔한 수준, 장기 분산 = 표본 분산)
     FALLBACK = {"alpha": 0.05, "beta": 0.90, "nu": 8.0}
@@ -213,7 +214,17 @@ class GarchVolForecaster:
         last = x[-1] if n else 0.0
         self.sigma2_next = (omega + (alpha + self.gamma * (last < 0)) * last ** 2 + beta * s2[-1]) / 1e4
         self.cond_vol = np.sqrt(s2 / 1e4 * self.trading_days)
+        self.std_resid = x / np.sqrt(s2) if n >= 2 and var0 > 0 else np.array([])
         return self
+
+    def tail(self, p, innov="t"):
+        """분산 1 기준 충격의 아래쪽 p 분위수(음수)와 그 너머 평균 크기(양수 = ES). 하루 VaR·ES = 그날 변동성 × 이 값.
+        innov: 't' = 추정한 대칭 t분포(정규면 정규), 'fhs' = 적합 구간 표준화 잔차의 실제 분포 (필터링 역사적 시뮬레이션)."""
+        if innov == "fhs" and len(self.std_resid) >= 50:
+            z = self.std_resid
+            q = float(np.quantile(z, p))
+            return q, float(-z[z <= q].mean())
+        return _std_quantile(p, self.nu), _std_es(p, self.nu)
 
     def next_var(self, s2, e):
         """오늘 분산 s2와 오늘 충격 e(평균을 뺀 일간 수익률, 소수) → 내일 분산."""
@@ -237,17 +248,22 @@ class GarchVolForecaster:
         """향후 horizon_days 동안의 평균 변동성(연율, 소수)."""
         return float(np.sqrt(self.daily_var_path(horizon_days).mean() * self.trading_days))
 
-    def simulate(self, horizon_days, n_paths=10000, seed=0):
+    def simulate(self, horizon_days, n_paths=10000, seed=0, innov=None):
         """적합한 GARCH(+t 충격)로 앞으로 1..horizon_days일의 누적 로그수익률을 시뮬레이션 → (n_paths, horizon_days).
 
         평균은 0으로 둔다 (중앙값 ≈ 현재가). 변동성이 날마다 바뀌고 충격이 두꺼운 꼬리를 가지므로,
         정규분포 공식(±z·σ√h)보다 폭락·폭등 쪽 분위수가 현실에 가깝다. GJR이면 하락한 날 다음 변동성이 더 커진다.
+        innov: 충격 분포 — 't'(추정한 t분포) 또는 'fhs'(적합 구간의 표준화 잔차를 되뽑기). 생략하면 VAR_INNOV.
         """
+        innov = VAR_INNOV if innov is None else innov
         rng = np.random.default_rng(seed)
         s2 = np.full(n_paths, self.sigma2_next)
         cum, out = np.zeros(n_paths), np.empty((n_paths, horizon_days))
+        fhs = innov == "fhs" and len(self.std_resid) >= 50
         for k in range(horizon_days):
-            if np.isfinite(self.nu):
+            if fhs:
+                z = rng.choice(self.std_resid, n_paths)
+            elif np.isfinite(self.nu):
                 z = rng.standard_t(self.nu, n_paths) * np.sqrt((self.nu - 2) / self.nu)
             else:
                 z = rng.standard_normal(n_paths)
@@ -259,6 +275,9 @@ class GarchVolForecaster:
 
 
 VOL_MODELS = {"auto": "자동 (AIC로 고름)", "garch": "GARCH (대칭)", "gjr": "GJR-GARCH (하락 때 더 커짐)"}
+# 하루 VaR·ES와 시뮬레이션의 충격(꼬리) 분포. 바꾸는 규칙은 EXPERIMENTS.md에 사전 등록 (35종목 실제 데이터 비교로 판정)
+VAR_INNOVS = {"t": "t분포 (대칭, 모수 추정)", "fhs": "실제 잔차 분포 (FHS)"}
+VAR_INNOV = "t"
 
 
 def fit_vol_model(returns, model="auto", dist="t"):
@@ -601,7 +620,7 @@ def es_exceedance_test(loss, es, sigma):
 
 
 def var_backtest(returns, levels=(0.95, 0.99), window=750, refit_every=21, start=None, dist="t", model="garch",
-                 detail=False):
+                 detail=False, innov="t"):
     """하루 VaR·ES 워크포워드 검증: refit_every일마다 그때까지의 수익률로 GARCH를 다시 적합하고,
     그 사이에는 실제 수익률로 조건부 분산만 갱신하며 매일 다음 날 VaR·ES를 낸다 (앱 화면의 VaR와 같은 평균 0 가정).
     겹치지 않는 하루 단위라 Kupiec·Christoffersen 검정을 그대로 쓸 수 있다.
@@ -610,40 +629,47 @@ def var_backtest(returns, levels=(0.95, 0.99), window=750, refit_every=21, start
            실제 데이터 검증 보고서는 더 긴 기간을 쓴다.
     예외 비율 검정에 더해: 예외일 손실 ÷ 예측 ES(1에 가까워야)와 ES 검정 p값(McNeil·Frey), 분위수 손실(모델끼리 비교용,
     낮을수록 좋음), 재적합 수와 그중 추정에 실패해 기본값을 쓴 횟수.
+    innov: 꼬리 분포 't' | 'fhs' (GarchVolForecaster.tail). 튜플로 주면 같은 GARCH 적합을 공유해 방법별로 계산하고
+           {방법: 표} (detail이면 {방법: (표, 날짜별 표)})를 돌려준다.
     detail=True면 (표, 날짜별 표: 수익률·변동성·수준별 VaR·ES·예외)를 돌려준다.
     """
+    innovs = (innov,) if isinstance(innov, str) else tuple(innov)
     r = np.asarray(returns, float)
     n = len(r)
     start = max(250, n - 500) if start is None else start
-    sig, V, E = [], {lv: [] for lv in levels}, {lv: [] for lv in levels}
+    sig = []
+    V = {(m, lv): [] for m in innovs for lv in levels}
+    E = {(m, lv): [] for m in innovs for lv in levels}
     n_fit = n_fail = 0
     for b in range(start, n, refit_every):
         g = fit_vol_model(r[max(0, b - window):b], model, dist)
         n_fit, n_fail = n_fit + 1, n_fail + (not g.converged)
-        zq = {lv: _std_quantile(1 - lv, g.nu) for lv in levels}
-        ze = {lv: _std_es(1 - lv, g.nu) for lv in levels}
+        tails = {(m, lv): g.tail(1 - lv, m) for m in innovs for lv in levels}
         s2 = g.sigma2_next
         for t in range(b, min(b + refit_every, n)):
             sd = np.sqrt(s2)
             sig.append(sd)
-            for lv in levels:
-                V[lv].append(-zq[lv] * sd)
-                E[lv].append(ze[lv] * sd)
+            for key, (zq, ze) in tails.items():
+                V[key].append(-zq * sd)
+                E[key].append(ze * sd)
             s2 = g.next_var(s2, r[t] - g.mu)
     x, sig = r[start:], np.array(sig)
-    rows, daily = {}, {"수익률": x, "변동성": sig}
-    for lv in levels:
-        v, e = np.array(V[lv]), np.array(E[lv])
-        hit = x < -v
-        row = var_exception_tests(hit, 1 - lv)
-        row["예외일 손실 ÷ 예측 ES"], row["ES 검정 p값"] = es_exceedance_test(-x[hit], e[hit], sig[hit])
-        tau = 1 - lv
-        row["분위수 손실(×10⁴)"] = float(np.mean((x + v) * (tau - (x < -v))) * 1e4)
-        row["재적합 수"], row["추정 실패"] = n_fit, n_fail
-        rows[f"하루 VaR {lv:.0%}"] = row
-        daily.update({f"VaR {lv:.0%}": v, f"ES {lv:.0%}": e, f"예외 {lv:.0%}": hit})
-    table = pd.DataFrame(rows).T
-    return (table, pd.DataFrame(daily)) if detail else table
+    out = {}
+    for m in innovs:
+        rows, daily = {}, {"수익률": x, "변동성": sig}
+        for lv in levels:
+            v, e = np.array(V[(m, lv)]), np.array(E[(m, lv)])
+            hit = x < -v
+            row = var_exception_tests(hit, 1 - lv)
+            row["예외일 손실 ÷ 예측 ES"], row["ES 검정 p값"] = es_exceedance_test(-x[hit], e[hit], sig[hit])
+            tau = 1 - lv
+            row["분위수 손실(×10⁴)"] = float(np.mean((x + v) * (tau - (x < -v))) * 1e4)
+            row["재적합 수"], row["추정 실패"] = n_fit, n_fail
+            rows[f"하루 VaR {lv:.0%}"] = row
+            daily.update({f"VaR {lv:.0%}": v, f"ES {lv:.0%}": e, f"예외 {lv:.0%}": hit})
+        table = pd.DataFrame(rows).T
+        out[m] = (table, pd.DataFrame(daily)) if detail else table
+    return out[innov] if isinstance(innov, str) else out
 
 
 def var_es(log_returns, level=0.95):

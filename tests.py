@@ -274,6 +274,13 @@ assert tab.loc["composite", "평균 IC"] > 0.05            # 고정 가중도 (�
 _cs, _be = uv.cost_sensitivity(wf_u)
 assert _cs["초과수익(연, 비용후)"].is_monotonic_decreasing and _be > 0
 assert abs(uv.evaluate(wf_u, _be, models=["auto"])[0].loc["auto", "상위20% 초과수익(연, 비용후)"]) < 1e-9
+# 최근 구간을 뺀 성적: 보유 기간이 그 전에 끝난 리밸런싱만, 그 기간들의 초과수익 평균과 같다
+_cv0 = uv.evaluate(wf_u, 5)[1]
+_dr = uv.drop_recent(wf_u, _cv0, days=150)
+_exu = (uv._period_returns(_cv0["auto"]["상위 20% (비용 후)"]) - uv._period_returns(_cv0["_universe"])).dropna()
+_ixu = wf_u["universe"].index
+_kp = [d for d in _exu.index if _ixu.get_loc(d) + 21 + 1 <= len(_ixu) - 1 - 150]
+assert _dr["리밸런싱 수"] == len(_kp) < len(_exu) and np.isclose(_dr["초과수익(연)"], _exu[_kp].mean() * 252 / 21)
 # 시장 구간별: 기간을 범위 평균 수익률 3분위로 나눔 (모든 기간이 한 번씩)
 _mb = uv.market_breakdown(uv.evaluate(wf_u, 5)[1])
 assert list(_mb.index) == ["하락", "횡보", "상승"] and _mb["기간 수"].sum() == tab.loc["auto", "리밸런싱 수"]
@@ -460,6 +467,31 @@ assert _vt_n.loc["하루 VaR 99%", "예외일 손실 ÷ 예측 ES"] > 1.15 and _
 assert _vt_n.loc["하루 VaR 99%", "분위수 손실(×10⁴)"] > _vt_t.loc["하루 VaR 99%", "분위수 손실(×10⁴)"]
 assert (_vd_t["예외 95%"] == (_vd_t["수익률"] < -_vd_t["VaR 95%"])).all() and (_vd_t["ES 99%"] > _vd_t["VaR 99%"]).all()
 assert np.isnan(es_exceedance_test([0.03, 0.04], [0.02, 0.02], [0.01, 0.01])[1])          # 예외 3번 미만 → p값 없음
+
+# 꼬리 분포 FHS(실제 잔차): 't'는 추정한 t분포 공식과 같고, 'fhs'는 적합 구간 표준화 잔차의 실제 분위수·꼬리 평균
+from quant_engine import _std_quantile as _sq
+_gf = GarchVolForecaster().fit(_xv[:750])
+assert _gf.tail(0.05, "t") == (_sq(0.05, _gf.nu), _std_es(0.05, _gf.nu)) and len(_gf.std_resid) == 750
+_zq, _ze = _gf.tail(0.01, "fhs")
+assert np.isclose(_zq, np.quantile(_gf.std_resid, 0.01)) and np.isclose(_ze, -_gf.std_resid[_gf.std_resid <= _zq].mean())
+assert set(np.round(_gf.simulate(1, 500, innov="fhs")[:, 0] / np.sqrt(_gf.sigma2_next), 9)) <= set(np.round(_gf.std_resid, 9))
+assert np.allclose(_gf.simulate(3, 200), _gf.simulate(3, 200, innov="t"))                   # 기본 = VAR_INNOV ('t')
+# 여러 방법을 한 번에: 같은 GARCH 적합을 공유하고, 't' 결과는 하나만 계산한 것과 같다
+_vb2 = var_backtest(_xv, start=800, refit_every=42, innov=("t", "fhs"))
+assert _vb2["t"].equals(_vt_t) and set(_vb2) == {"t", "fhs"}
+# 하락 쪽 꼬리가 더 두꺼운 충격(지수처럼): 대칭 t는 95% VaR를 넘는 날이 목표보다 많고, FHS는 목표 근처
+_tt = np.random.default_rng(1).standard_t(5, 2300)
+_zs = np.where(_tt < 0, 1.4 * _tt, 0.7 * _tt)
+_zs = (_zs - _zs.mean()) / _zs.std()
+_xs, _s2 = np.empty(2300), 1e-4
+for _i in range(2300):
+    _xs[_i] = np.sqrt(_s2) * _zs[_i]
+    _s2 = 2e-6 + 0.08 * _xs[_i] ** 2 + 0.9 * _s2
+_vsk = var_backtest(_xs, start=800, refit_every=42, innov=("t", "fhs"))
+assert _vsk["t"].loc["하루 VaR 95%", "예외 비율"] > 0.06 and _vsk["t"].loc["하루 VaR 95%", "종합 p값"] < 0.05
+assert 0.04 < _vsk["fhs"].loc["하루 VaR 95%", "예외 비율"] < 0.06 and _vsk["fhs"].loc["하루 VaR 95%", "종합 p값"] > 0.05
+assert abs(_vsk["fhs"].loc["하루 VaR 95%", "예외일 손실 ÷ 예측 ES"] - 1) < abs(_vsk["t"].loc["하루 VaR 95%", "예외일 손실 ÷ 예측 ES"] - 1)
+assert _vsk["fhs"]["분위수 손실(×10⁴)"].sum() < _vsk["t"]["분위수 손실(×10⁴)"].sum()
 
 v95, es95 = var_es(np.random.default_rng(0).normal(0, 0.01, 400000), 0.95)
 assert abs(v95 - (1 - np.exp(-1.645 * 0.01))) < 3e-4 and es95 > v95
@@ -1041,15 +1073,31 @@ try:
     assert _vr["분할 초과 95% 하한"] <= _vr["분할 초과수익(연)"] <= _vr["분할 초과 95% 상한"] and 0 < _vr["분할 보유 평균 비중"] <= 1
     assert len(_vr["_obs"]) > 0 and (_vr["_obs"]["c"] >= 2 * vd.COST_BPS * 1e-4).all()      # 비용 = 수수료 양쪽 + 세금
     assert _vr["ES 검정"] in ("통과", "기각") and _vr["VaR 검증 일수"] > 500 and _vr["GARCH 진단"].count("수렴") == 1
+    assert _vr["[t] VaR 검정"] == _vr["VaR 검정"] and _vr["분위수 손실 비율 (FHS ÷ t)"] > 0          # 기본(t)의 본 표 = 비교 표의 t
+    # 사전 등록 규칙: 분위수 손실 비율 중앙값 < 1 이고 VaR·ES 통과 수가 줄지 않을 때만 FHS
+    _mk = lambda ratio, vt_, vf, et, ef: {"[t] VaR 검정": vt_, "[fhs] VaR 검정": vf, "[t] ES 검정": et, "[fhs] ES 검정": ef,
+                                          "분위수 손실 비율 (FHS ÷ t)": ratio}
+    assert vd.var_tail_rule([_mk(0.98, "기각", "통과", "통과", "통과"), _mk(0.99, "통과", "통과", "통과", "통과")])["FHS 채택"]
+    assert not vd.var_tail_rule([_mk(0.98, "통과", "기각", "통과", "통과"), _mk(0.99, "통과", "통과", "통과", "통과")])["FHS 채택"]
+    assert not vd.var_tail_rule([_mk(1.02, "기각", "통과", "통과", "통과"), _mk(1.01, "통과", "통과", "통과", "통과")])["FHS 채택"]
     # 같은 데이터로 앱 방향 예측 탭과 같은 숫자 (같은 함수·같은 기본 설정)
     _wfv, _ = dr.walk_forward(_hist, 21, None, alt=None, ticker="005930.KS")
     _evv = dr.evaluate(_wfv, 21, np.log(_hist).diff(), 3.0, lag=1, sell_tax=kc.sell_tax_rate(_hist.index, "KOSPI"))
     assert np.isclose(_vr["방향 z"], _evv["z"]) and np.isclose(_vr["방향 전략 최대 낙폭"], _evv["mdd"])
+    # 최근 1년을 뺀 재채점 = 마지막 1년을 지우고 처음부터 다시 돌린 것과 같다 (워크포워드라 그 전 예측은 이후 데이터와 무관)
+    _cut = _hist.index[-uv.RECENT_DAYS - 1]
+    assert _vr["[최근1년 제외] 끝"] == str(_cut.date())
+    _wfc2, _ = dr.walk_forward(_hist.loc[:_cut], 21, None, alt=None, ticker="005930.KS")
+    _evc2 = dr.evaluate(_wfc2, 21, np.log(_hist.loc[:_cut]).diff(), 3.0, lag=1, sell_tax=kc.sell_tax_rate(_hist.index, "KOSPI"))
+    assert np.isclose(_vr["[최근1년 제외] 방향 z"], _evc2["z"]) and np.isclose(_vr["[최근1년 제외] 확률 정확도"], _evc2["skill"])
+    assert np.isfinite(_vr["분위수 손실 비율 앞 절반"]) and np.isfinite(_vr["분위수 손실 비율 뒤 절반"])
     with tempfile.TemporaryDirectory() as _vd:
         _rows = vd.run(["005930.KS", "없는종목.KS"], out_dir=_vd, say=lambda m: None)
         _md = (Path(_vd) / "README.md").read_text(encoding="utf-8")
         assert "테스트전자" in _md and "계산하지 못한 종목" in _md and "없는종목.KS: ValueError" in _md   # 한 종목 실패해도 나머지는 보고
         assert "## 21일 분할 보유 전략" in _md and "## 예측 확률 구간별 실제 21일 수익" in _md and "## 하루 VaR·ES 검정" in _md
+        assert "## 하루 VaR 꼬리 분포 비교" in _md and "판정:" in _md and "앞 절반" in _md
+        assert "## 최근 1년(이례적 급등락 구간)을 뺀 결과" in _md
         _sv = pd.read_csv(Path(_vd) / "summary.csv")
         assert len(_sv) == 2 and pd.isna(_sv.loc[0, "오류"]) and "주가 데이터 없음" in _sv.loc[1, "오류"]
 finally:

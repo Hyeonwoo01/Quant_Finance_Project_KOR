@@ -29,7 +29,7 @@ import market_data as md
 import regime as rg
 import repro
 import universe as uv
-from quant_engine import block_bootstrap_ci, fit_vol_model, var_backtest
+from quant_engine import VAR_INNOV, VAR_INNOVS, block_bootstrap_ci, fit_vol_model, var_backtest
 
 OUT_DIR = Path(__file__).parent / "validation"
 H, COST_BPS, LAG = 21, 3.0, 1          # 앱 기본 설정 (방향 예측 기간, 수수료·체결 비용 bp, 다음 날 종가 체결)
@@ -49,6 +49,32 @@ def _excess(daily):
     ex = (daily["strat"] - daily["asset"]).values
     lo, hi = block_bootstrap_ci(ex, BLOCK)
     return float(np.nanmean(ex) * 252), lo * 252, hi * 252
+
+
+def _quantile_loss(daily, lv):
+    """날짜별 표(var_backtest detail)의 lv 수준 분위수 손실 합 (낮을수록 좋음)."""
+    x, v = daily["수익률"].values, daily[f"VaR {lv:.0%}"].values
+    return float(np.sum((x + v) * ((1 - lv) - (x < -v))))
+
+
+def _without_recent(close, wf, r, tax, days):
+    """마지막 days거래일이 없었다고 보고 방향·분할 보유·국면 전략을 다시 채점 (보고용). 워크포워드라 그 전의 예측은 그대로."""
+    cut = close.index[-days - 1]
+    c = close.loc[:cut]
+    w = wf[wf.index <= cut].copy()
+    w["fwd"] = dr.forward_log_return(c, H).reindex(w.index)          # 그 뒤의 결과는 모르는 것으로
+    if w["fwd"].notna().sum() < 252:
+        return {}
+    rc = r.loc[:cut]
+    ev = dr.evaluate(w, H, rc, COST_BPS, lag=LAG, sell_tax=tax)
+    evh = dr.evaluate(w, H, rc, COST_BPS, lag=LAG, sell_tax=tax, hold=H)
+    reg = rg.analyze(c, COST_BPS, lag=LAG, sell_tax=tax)
+    out = {"[최근1년 제외] 끝": str(cut.date()), "[최근1년 제외] 방향 z": ev["z"], "[최근1년 제외] 확률 정확도": ev["skill"],
+           "[최근1년 제외] 방향 예측력": "있음" if ev["skill"] > 0 and ev["z"] > 2 else "확인 안 됨"}
+    for name, daily in (("방향", ev["daily"]), ("분할", evh["daily"]), ("국면", reg["daily"])):
+        e, lo, hi = _excess(daily)
+        out.update({f"[최근1년 제외] {name} 초과": e, f"[최근1년 제외] {name} 하한": lo, f"[최근1년 제외] {name} 상한": hi})
+    return out
 
 
 def validate(ticker):
@@ -108,11 +134,29 @@ def validate(ticker):
         "국면 초과수익(연)": g_ex, "국면 초과 95% 하한": g_lo, "국면 초과 95% 상한": g_hi,
         "국면 전략 경제적 가치": "있음" if g_lo > 0 else "확인 안 됨",
     })
+    # 최근 1년(이례적 급등락 구간)을 뺀 재채점 — 보고만 (EXPERIMENTS.md 사전 등록)
+    if len(close) > uv.RECENT_DAYS + 3 * 252:
+        try:
+            row.update(_without_recent(close, wf, r, tax, uv.RECENT_DAYS))
+        except Exception as e:                       # 기간이 짧은 종목 등 → 이 점검만 건너뜀
+            row["[최근1년 제외] 오류"] = f"{type(e).__name__}: {str(e)[:80]}"
 
     # 하루 VaR·ES 검정 (앱 기본: 자동 = AIC로 대칭/GJR 선택). 99% VaR는 500일에 예외가 5번 정도뿐이라 검정력이 약해
     # 첫 3년(학습)을 뺀 전체 기간을 쓴다. 앞·뒤 절반의 예외 비율로 시기에 따라 흔들리는지도 본다
     rr = r.dropna().values
-    vt, vd = var_backtest(rr, model="auto", start=max(min(VAR_START, len(rr) - 500), 250), detail=True)
+    # 꼬리 분포 두 후보(t, FHS)를 같은 GARCH 적합으로 함께 계산 — 앞의 본 표는 지금 기본(VAR_INNOV), 비교 표는 둘 다 (EXPERIMENTS.md 사전 등록)
+    both = var_backtest(rr, model="auto", start=max(min(VAR_START, len(rr) - 500), 250), detail=True, innov=tuple(VAR_INNOVS))
+    vt, vd = both[VAR_INNOV]
+    for m, (tab, _) in both.items():
+        row.update({f"[{m}] VaR 95% 예외": tab.loc["하루 VaR 95%", "예외 비율"], f"[{m}] VaR 99% 예외": tab.loc["하루 VaR 99%", "예외 비율"],
+                    f"[{m}] VaR 검정": "통과" if min(tab["종합 p값"]) > 0.05 else "기각",
+                    f"[{m}] ES 검정": "통과" if np.nanmin(tab["ES 검정 p값"].astype(float).fillna(1.0)) > 0.05 else "기각",
+                    f"[{m}] 분위수 손실": float(tab["분위수 손실(×10⁴)"].sum())})
+    row["분위수 손실 비율 (FHS ÷ t)"] = row["[fhs] 분위수 손실"] / row["[t] 분위수 손실"]
+    # 앞·뒤 절반 각각의 분위수 손실 비율 (보고만 — 최근 급등락 구간에만 기대는지)
+    for part, sl in (("앞 절반", slice(None, len(both["t"][1]) // 2)), ("뒤 절반", slice(len(both["t"][1]) // 2, None))):
+        ql = {m: sum(_quantile_loss(d.iloc[sl], lv) for lv in (0.95, 0.99)) for m, (_, d) in both.items()}
+        row[f"분위수 손실 비율 {part}"] = ql["fhs"] / ql["t"] if ql["t"] > 0 else np.nan
     half = len(vd) // 2
     v95, v99 = vt.loc["하루 VaR 95%"], vt.loc["하루 VaR 99%"]
     row.update({"VaR 검증 일수": int(v95["관측일"]),
@@ -133,6 +177,26 @@ def validate(ticker):
     return row
 
 
+def var_tail_rule(rows):
+    """VaR 꼬리 분포 사전 등록 규칙 (EXPERIMENTS.md): 종목별 분위수 손실 비율(FHS ÷ t)의 중앙값 < 1 이고,
+    FHS의 VaR·ES 검정 통과 종목 수가 t보다 줄지 않으면 FHS 채택. 반환: 판정에 쓴 숫자와 결론."""
+    ok = [r for r in rows if "오류" not in r and np.isfinite(r.get("분위수 손실 비율 (FHS ÷ t)", np.nan))]
+    if not ok:
+        return None
+    cnt = lambda m, k: sum(r[f"[{m}] {k}"] == "통과" for r in ok)
+    ratio = float(np.median([r["분위수 손실 비율 (FHS ÷ t)"] for r in ok]))
+    res = {"종목 수": len(ok), "분위수 손실 비율 중앙값": ratio,
+           "FHS가 나은 종목": sum(r["분위수 손실 비율 (FHS ÷ t)"] < 1 for r in ok),
+           "VaR 통과 t": cnt("t", "VaR 검정"), "VaR 통과 FHS": cnt("fhs", "VaR 검정"),
+           "ES 통과 t": cnt("t", "ES 검정"), "ES 통과 FHS": cnt("fhs", "ES 검정")}
+    res["FHS 채택"] = bool(ratio < 1 and res["VaR 통과 FHS"] >= res["VaR 통과 t"] and res["ES 통과 FHS"] >= res["ES 통과 t"])
+    for part in ("앞 절반", "뒤 절반"):                   # 보고만 (판정에 쓰지 않음)
+        v = [r[f"분위수 손실 비율 {part}"] for r in ok if np.isfinite(r.get(f"분위수 손실 비율 {part}", np.nan))]
+        res[f"{part} 중앙값"] = float(np.median(v)) if v else np.nan
+        res[f"{part} FHS가 나은 종목"] = int(sum(x < 1 for x in v))
+    return res
+
+
 def ranking_summary(rank_dir=uv.RANK_DIR):
     """코스피 종목 고르기 (매주 계산 결과, 앱 기본: 교체 63거래일·다음 날 체결·세금 반영)의 요약. 없으면 None."""
     w = uv.load_weekly(Path(rank_dir) / uv.RESULTS_PATH.name)
@@ -149,7 +213,7 @@ def ranking_summary(rank_dir=uv.RANK_DIR):
             "손익분기 비용(bp)": cs[1] if cs is not None else np.nan,
             "변동성 역가중 초과수익(연)": rw["상위20% 초과수익(연, 비용후)"] if rw is not None else np.nan,
             "변동성 역가중 t값": rw["초과수익 t값"] if rw is not None else np.nan,
-            "시장 구간별": U.get("market"),
+            "시장 구간별": U.get("market"), "최근1년 제외": U.get("ex_recent"),
             "기준 전략": {uv.MODEL_LABELS[m]: U["table"].loc[m, "상위20% 초과수익(연, 비용후)"]
                        for m in ("momentum", *uv.BASELINES) if m in U["table"].index},
             "초과수익(연, 비용후)": a["상위20% 초과수익(연, 비용후)"], "초과수익 t값": a["초과수익 t값"],
@@ -250,6 +314,41 @@ def report_markdown(rows, rank=None, when="", version="", buckets=None):
                      f"{_num(r['ES 95% 손실 비율'], '{:.2f}')} · {_num(r['ES 99% 손실 비율'], '{:.2f}')} | "
                      f"{_num(r['ES 95% p값'], '{:.2f}')} · {_num(r['ES 99% p값'], '{:.2f}')} | {r['ES 검정']} | "
                      f"{_pct(r['VaR 95% 예외 (앞 절반)'], False)} · {_pct(r['VaR 95% 예외 (뒤 절반)'], False)} |")
+    rule = var_tail_rule(rows)
+    if rule:
+        lines += ["", "## 하루 VaR 꼬리 분포 비교: t분포 vs 실제 잔차(FHS) — 사전 등록 규칙", "",
+                  f"지금 기본: {VAR_INNOVS[VAR_INNOV]}. 규칙([EXPERIMENTS.md](../EXPERIMENTS.md)): 종목별 분위수 손실 비율(FHS ÷ t, 95%+99%)의 "
+                  "중앙값이 1보다 작고, FHS의 VaR·ES 검정 통과 종목 수가 t보다 줄지 않으면 FHS로 바꿉니다.", "",
+                  f"- 분위수 손실 비율 중앙값: {rule['분위수 손실 비율 중앙값']:.3f} (FHS가 나은 종목 {rule['FHS가 나은 종목']} / {rule['종목 수']})",
+                  f"- VaR 검정 통과: t {rule['VaR 통과 t']} → FHS {rule['VaR 통과 FHS']} · ES 검정 통과: t {rule['ES 통과 t']} → FHS {rule['ES 통과 FHS']}",
+                  f"- 판정: **{'FHS 채택 조건 충족' if rule['FHS 채택'] else 'FHS 채택 조건 미충족 → t 유지'}**",
+                  f"- (보고만) 앞 절반: 비율 중앙값 {_num(rule['앞 절반 중앙값'], '{:.3f}')}, FHS가 나은 종목 {rule['앞 절반 FHS가 나은 종목']} · "
+                  f"뒤 절반: {_num(rule['뒤 절반 중앙값'], '{:.3f}')}, {rule['뒤 절반 FHS가 나은 종목']}종목 — 최근 급등락 구간에서만 나은지 확인", "",
+                  "| 종목 | 95% 예외 t · FHS | 99% 예외 t · FHS | VaR 검정 t · FHS | ES 검정 t · FHS | 분위수 손실 비율 (FHS ÷ t) | 앞 절반 · 뒤 절반 |",
+                  "|---|---|---|---|---|---|---|"]
+        for r in ok:
+            if "[fhs] VaR 검정" not in r:
+                continue
+            lines.append(f"| {r['이름']} | {_pct(r['[t] VaR 95% 예외'], False)} · {_pct(r['[fhs] VaR 95% 예외'], False)} | "
+                         f"{_pct(r['[t] VaR 99% 예외'], False)} · {_pct(r['[fhs] VaR 99% 예외'], False)} | "
+                         f"{r['[t] VaR 검정']} · {r['[fhs] VaR 검정']} | {r['[t] ES 검정']} · {r['[fhs] ES 검정']} | "
+                         f"{_num(r['분위수 손실 비율 (FHS ÷ t)'], '{:.3f}')} | "
+                         f"{_num(r.get('분위수 손실 비율 앞 절반', np.nan), '{:.3f}')} · {_num(r.get('분위수 손실 비율 뒤 절반', np.nan), '{:.3f}')} |")
+    rec = [r for r in ok if "[최근1년 제외] 방향 z" in r]
+    if rec:
+        cnt = lambda k: sum(r[f"[최근1년 제외] {k} 하한"] > 0 for r in rec)
+        lines += ["", "## 최근 1년(이례적 급등락 구간)을 뺀 결과 — 보고만", "",
+                  "데이터 마지막 날에서 252거래일 전까지만 있었다고 보고 같은 계산을 했습니다 (그 뒤 결과가 필요한 예측·보유는 채점하지 않음). "
+                  "위의 전체 기간 결과와 크게 다르면 그 결과는 최근 구간에 기댄 것입니다. 판정 기준은 위와 같습니다.", "",
+                  f"- 방향 예측력 있음: {sum(r['[최근1년 제외] 방향 예측력'] == '있음' for r in rec)} / {len(rec)}종목 "
+                  f"(전체 기간: {sum(r['방향 예측력'] == '있음' for r in rec)})",
+                  f"- 경제적 가치 있음(95% 구간 하한 > 0): 방향 {cnt('방향')}, 21일 분할 보유 {cnt('분할')}, 국면 {cnt('국면')} / {len(rec)}종목", "",
+                  "| 종목 | 끝 | z (전체 → 제외) | 방향 초과(연) [95%] | 분할 보유 초과(연) [95%] | 국면 초과(연) [95%] |", "|---|---|---|---|---|---|"]
+        for r in rec:
+            f3 = lambda k: (f"{_pct(r[f'[최근1년 제외] {k} 초과'])} [{_pct(r[f'[최근1년 제외] {k} 하한'])}, "
+                            f"{_pct(r[f'[최근1년 제외] {k} 상한'])}]")
+            lines.append(f"| {r['이름']} | {r['[최근1년 제외] 끝']} | {_num(r['방향 z'], '{:+.1f}')} → {_num(r['[최근1년 제외] 방향 z'], '{:+.1f}')} | "
+                         f"{f3('방향')} | {f3('분할')} | {f3('국면')} |")
     if rank:
         lines += ["", "## 코스피 종목 고르기 (상위 20%, 교체 63거래일, 비용·세금 후, 전체 평균 대비)", "",
                   "| 데이터 | 리밸런싱 | 초과수익(연) | t | 평균 IC | IC t | 최대 낙폭 | 요인 알파(연) | 알파 t | DSR | 실전 기록 (21일 채점 수 · 평균 초과) | 경제적 가치 |",
@@ -263,6 +362,10 @@ def report_markdown(rows, rank=None, when="", version="", buckets=None):
                   f"- 손익분기 비용: 매수·매도 각각 {_num(rank['손익분기 비용(bp)'], '{:.0f}')}bp (이보다 비용·슬리피지가 크면 초과수익 0 이하)",
                   f"- 위험 반영 비중(변동성 역가중): 초과수익 {_pct(rank['변동성 역가중 초과수익(연)'])} (t {_num(rank['변동성 역가중 t값'], '{:+.1f}')})",
                   "- 같은 조건의 기준 전략 초과수익(연): " + (", ".join(f"{k} {_pct(v)}" for k, v in rank["기준 전략"].items()) or "—")]
+        xr = rank.get("최근1년 제외")
+        if xr:
+            lines.append(f"- 최근 1년을 뺀 결과 (보고만, {xr['끝'].date()}까지 끝난 리밸런싱 {xr['리밸런싱 수']}번): 초과수익 {_pct(xr['초과수익(연)'])} "
+                         f"(t {_num(xr['초과수익 t값'], '{:+.1f}')}), 평균 IC {_num(xr['평균 IC'], '{:+.3f}')} (t {_num(xr['IC t값'], '{:+.1f}')})")
         mk = rank.get("시장 구간별")
         if mk is not None:
             lines += ["", "| 시장 구간 (리밸런싱 기간의 범위 평균 수익률 3분위) | 기간 수 | 시장 평균 | 초과수익 평균 | 초과 > 0 비율 |", "|---|---|---|---|---|"]
@@ -298,7 +401,14 @@ def run(tickers, out_dir=OUT_DIR, say=print):
                 f"  하루 VaR: 95% 예외 {r['VaR 95% 예외 비율']:.1%} (p {r['VaR 95% p값']:.2f}), "
                 f"99% 예외 {r['VaR 99% 예외 비율']:.1%} (p {r['VaR 99% p값']:.2f}) → {r['VaR 검정']} ({r['VaR 검증 일수']:,}일)\n"
                 f"  ES: 손실 비율 95% {r['ES 95% 손실 비율']:.2f}·99% {r['ES 99% 손실 비율']:.2f} "
-                f"(p {r['ES 95% p값']:.2f}·{r['ES 99% p값']:.2f}) → {r['ES 검정']} | GARCH 재적합 실패 {r['GARCH 재적합 실패']} | {r['GARCH 진단']}")
+                f"(p {r['ES 95% p값']:.2f}·{r['ES 99% p값']:.2f}) → {r['ES 검정']} | GARCH 재적합 실패 {r['GARCH 재적합 실패']} | {r['GARCH 진단']}\n"
+                f"  꼬리 분포 비교: 95% 예외 t {r['[t] VaR 95% 예외']:.1%}·FHS {r['[fhs] VaR 95% 예외']:.1%}, "
+                f"99% 예외 t {r['[t] VaR 99% 예외']:.1%}·FHS {r['[fhs] VaR 99% 예외']:.1%}, VaR {r['[t] VaR 검정']}·{r['[fhs] VaR 검정']}, "
+                f"ES {r['[t] ES 검정']}·{r['[fhs] ES 검정']}, 분위수 손실 비율 {r['분위수 손실 비율 (FHS ÷ t)']:.3f} "
+                f"(앞 {r.get('분위수 손실 비율 앞 절반', np.nan):.3f}·뒤 {r.get('분위수 손실 비율 뒤 절반', np.nan):.3f})"
+                + (f"\n  최근 1년 제외({r['[최근1년 제외] 끝']}까지): z {r['[최근1년 제외] 방향 z']:+.1f}, "
+                   f"방향 초과 {r['[최근1년 제외] 방향 초과']:+.1%} [{r['[최근1년 제외] 방향 하한']:+.1%}, {r['[최근1년 제외] 방향 상한']:+.1%}], "
+                   f"분할 {r['[최근1년 제외] 분할 초과']:+.1%}, 국면 {r['[최근1년 제외] 국면 초과']:+.1%}" if "[최근1년 제외] 방향 z" in r else ""))
         except Exception as e:                    # 한 종목이 실패해도 나머지는 계속
             rows.append({"종목": t, "이름": t, "오류": f"{type(e).__name__}: {str(e)[:200]}"})
             say(f"{t}: 실패 — {rows[-1]['오류']}")
@@ -318,4 +428,5 @@ if __name__ == "__main__":
     t_all = time.time()
     rows = run(["^KS11", "005930.KS"] if smoke else fl.tickers(), say=lambda m: print(m, flush=True))
     print(f"총 {time.time() - t_all:.0f}초, 실패 {sum('오류' in r for r in rows)}종목", flush=True)
+    print("VaR 꼬리 분포 사전 등록 규칙:", var_tail_rule(rows), flush=True)
     sys.exit(1 if all("오류" in r for r in rows) else 0)
