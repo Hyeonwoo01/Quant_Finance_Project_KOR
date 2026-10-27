@@ -459,6 +459,23 @@ LR_{\text{POF}} = -2\ln\frac{(1-p)^{n-x}p^{x}}{(1-\hat\pi)^{n-x}\hat\pi^{x}} \si
 - **Christoffersen**: 예외가 몰려 나오지 않는가 (전날 예외 여부와 독립인가, $`\chi^2_1`$).
 - **종합**: 두 통계량의 합 $`\sim\chi^2_2`$. p값 > 0.05면 통과.
 
+### 꼬리 분포: t분포 vs 실제 잔차(FHS)
+하루 VaR·ES = 그날 GARCH 변동성 × 분산 1인 충격 분포의 아래쪽 분위수·꼬리 평균입니다. 충격 분포를 두 가지로 둘 수 있습니다.
+
+- **t분포**: 추정한 자유도 $`\nu`$의 대칭 t분포. 꼬리는 두껍지만 좌우가 같습니다.
+- **실제 잔차 (FHS, 필터링 역사적 시뮬레이션)**: 학습 구간(750일)의 표준화 잔차 $`z_t = \varepsilon_t/\sigma_t`$를 그대로 씁니다.
+
+```math
+\mathrm{VaR}_{p,t+1} = -\sigma_{t+1}\, \hat q_p(z), \qquad \mathrm{ES}_{p,t+1} = -\sigma_{t+1}\, \overline{z \mid z \le \hat q_p(z)}
+```
+
+  모수를 더하지 않고 하락 쪽 꼬리가 더 두꺼운 비대칭을 자료 그대로 반영합니다. 시뮬레이션(가격 범위)에서는 잔차를 되뽑습니다.
+  99% 분위수는 750개 중 약 7개로 정해져 흔들릴 수 있습니다.
+
+시뮬레이션(하락 쪽 꼬리가 1.4배 두꺼운 t(5) 충격의 GARCH, 1,500일)에서 대칭 t는 95% VaR를 넘은 날 6.6%(기각), FHS는 5.1%(통과)였습니다.
+어느 쪽을 기본으로 쓸지는 결과를 보기 전에 [EXPERIMENTS.md](EXPERIMENTS.md)에 적은 규칙(35종목 분위수 손실 비율의 중앙값, 검정 통과 수)으로 정합니다.
+코드: `GarchVolForecaster.tail`, `simulate(innov=)`, `var_backtest(innov=)`, `VAR_INNOV` (`quant_engine.py`), `var_tail_rule` (`validation.py`).
+
 ### ES 검정 (예외일 손실의 크기)
 예외 '횟수'가 맞아도 넘을 때 얼마나 크게 넘는지는 따로 봐야 합니다. 예측 ES는 분산이 1인 충격 분포의 꼬리 평균에 그날 변동성을 곱한 값입니다
 (t분포: $`\mathrm{ES}_p = \sigma_t \, \frac{f_\nu(q)}{p}\,\frac{\nu + q^2}{\nu - 1}\sqrt{\frac{\nu-2}{\nu}}`$, $`q = F_\nu^{-1}(p)`$).
