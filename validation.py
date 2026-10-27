@@ -29,7 +29,7 @@ import market_data as md
 import regime as rg
 import repro
 import universe as uv
-from quant_engine import block_bootstrap_ci, fit_vol_model, var_backtest
+from quant_engine import VAR_INNOV, VAR_INNOVS, block_bootstrap_ci, fit_vol_model, var_backtest
 
 OUT_DIR = Path(__file__).parent / "validation"
 H, COST_BPS, LAG = 21, 3.0, 1          # 앱 기본 설정 (방향 예측 기간, 수수료·체결 비용 bp, 다음 날 종가 체결)
@@ -112,7 +112,15 @@ def validate(ticker):
     # 하루 VaR·ES 검정 (앱 기본: 자동 = AIC로 대칭/GJR 선택). 99% VaR는 500일에 예외가 5번 정도뿐이라 검정력이 약해
     # 첫 3년(학습)을 뺀 전체 기간을 쓴다. 앞·뒤 절반의 예외 비율로 시기에 따라 흔들리는지도 본다
     rr = r.dropna().values
-    vt, vd = var_backtest(rr, model="auto", start=max(min(VAR_START, len(rr) - 500), 250), detail=True)
+    # 꼬리 분포 두 후보(t, FHS)를 같은 GARCH 적합으로 함께 계산 — 앞의 본 표는 지금 기본(VAR_INNOV), 비교 표는 둘 다 (EXPERIMENTS.md 사전 등록)
+    both = var_backtest(rr, model="auto", start=max(min(VAR_START, len(rr) - 500), 250), detail=True, innov=tuple(VAR_INNOVS))
+    vt, vd = both[VAR_INNOV]
+    for m, (tab, _) in both.items():
+        row.update({f"[{m}] VaR 95% 예외": tab.loc["하루 VaR 95%", "예외 비율"], f"[{m}] VaR 99% 예외": tab.loc["하루 VaR 99%", "예외 비율"],
+                    f"[{m}] VaR 검정": "통과" if min(tab["종합 p값"]) > 0.05 else "기각",
+                    f"[{m}] ES 검정": "통과" if np.nanmin(tab["ES 검정 p값"].astype(float).fillna(1.0)) > 0.05 else "기각",
+                    f"[{m}] 분위수 손실": float(tab["분위수 손실(×10⁴)"].sum())})
+    row["분위수 손실 비율 (FHS ÷ t)"] = row["[fhs] 분위수 손실"] / row["[t] 분위수 손실"]
     half = len(vd) // 2
     v95, v99 = vt.loc["하루 VaR 95%"], vt.loc["하루 VaR 99%"]
     row.update({"VaR 검증 일수": int(v95["관측일"]),
@@ -131,6 +139,22 @@ def validate(ticker):
     row["GARCH 진단"] = (f"{g.name} · 시작값 {fi.get('수렴', 0)}/{fi.get('시작값', 0)} 수렴 · 우도 차이 {fi.get('우도 차이', 0.0):.3f}"
                        + (f" · 경계: {', '.join(fi['경계'])}" if fi.get("경계") else ""))
     return row
+
+
+def var_tail_rule(rows):
+    """VaR 꼬리 분포 사전 등록 규칙 (EXPERIMENTS.md): 종목별 분위수 손실 비율(FHS ÷ t)의 중앙값 < 1 이고,
+    FHS의 VaR·ES 검정 통과 종목 수가 t보다 줄지 않으면 FHS 채택. 반환: 판정에 쓴 숫자와 결론."""
+    ok = [r for r in rows if "오류" not in r and np.isfinite(r.get("분위수 손실 비율 (FHS ÷ t)", np.nan))]
+    if not ok:
+        return None
+    cnt = lambda m, k: sum(r[f"[{m}] {k}"] == "통과" for r in ok)
+    ratio = float(np.median([r["분위수 손실 비율 (FHS ÷ t)"] for r in ok]))
+    res = {"종목 수": len(ok), "분위수 손실 비율 중앙값": ratio,
+           "FHS가 나은 종목": sum(r["분위수 손실 비율 (FHS ÷ t)"] < 1 for r in ok),
+           "VaR 통과 t": cnt("t", "VaR 검정"), "VaR 통과 FHS": cnt("fhs", "VaR 검정"),
+           "ES 통과 t": cnt("t", "ES 검정"), "ES 통과 FHS": cnt("fhs", "ES 검정")}
+    res["FHS 채택"] = bool(ratio < 1 and res["VaR 통과 FHS"] >= res["VaR 통과 t"] and res["ES 통과 FHS"] >= res["ES 통과 t"])
+    return res
 
 
 def ranking_summary(rank_dir=uv.RANK_DIR):
@@ -250,6 +274,23 @@ def report_markdown(rows, rank=None, when="", version="", buckets=None):
                      f"{_num(r['ES 95% 손실 비율'], '{:.2f}')} · {_num(r['ES 99% 손실 비율'], '{:.2f}')} | "
                      f"{_num(r['ES 95% p값'], '{:.2f}')} · {_num(r['ES 99% p값'], '{:.2f}')} | {r['ES 검정']} | "
                      f"{_pct(r['VaR 95% 예외 (앞 절반)'], False)} · {_pct(r['VaR 95% 예외 (뒤 절반)'], False)} |")
+    rule = var_tail_rule(rows)
+    if rule:
+        lines += ["", "## 하루 VaR 꼬리 분포 비교: t분포 vs 실제 잔차(FHS) — 사전 등록 규칙", "",
+                  f"지금 기본: {VAR_INNOVS[VAR_INNOV]}. 규칙([EXPERIMENTS.md](../EXPERIMENTS.md)): 종목별 분위수 손실 비율(FHS ÷ t, 95%+99%)의 "
+                  "중앙값이 1보다 작고, FHS의 VaR·ES 검정 통과 종목 수가 t보다 줄지 않으면 FHS로 바꿉니다.", "",
+                  f"- 분위수 손실 비율 중앙값: {rule['분위수 손실 비율 중앙값']:.3f} (FHS가 나은 종목 {rule['FHS가 나은 종목']} / {rule['종목 수']})",
+                  f"- VaR 검정 통과: t {rule['VaR 통과 t']} → FHS {rule['VaR 통과 FHS']} · ES 검정 통과: t {rule['ES 통과 t']} → FHS {rule['ES 통과 FHS']}",
+                  f"- 판정: **{'FHS 채택 조건 충족' if rule['FHS 채택'] else 'FHS 채택 조건 미충족 → t 유지'}**", "",
+                  "| 종목 | 95% 예외 t · FHS | 99% 예외 t · FHS | VaR 검정 t · FHS | ES 검정 t · FHS | 분위수 손실 비율 (FHS ÷ t) |",
+                  "|---|---|---|---|---|---|"]
+        for r in ok:
+            if "[fhs] VaR 검정" not in r:
+                continue
+            lines.append(f"| {r['이름']} | {_pct(r['[t] VaR 95% 예외'], False)} · {_pct(r['[fhs] VaR 95% 예외'], False)} | "
+                         f"{_pct(r['[t] VaR 99% 예외'], False)} · {_pct(r['[fhs] VaR 99% 예외'], False)} | "
+                         f"{r['[t] VaR 검정']} · {r['[fhs] VaR 검정']} | {r['[t] ES 검정']} · {r['[fhs] ES 검정']} | "
+                         f"{_num(r['분위수 손실 비율 (FHS ÷ t)'], '{:.3f}')} |")
     if rank:
         lines += ["", "## 코스피 종목 고르기 (상위 20%, 교체 63거래일, 비용·세금 후, 전체 평균 대비)", "",
                   "| 데이터 | 리밸런싱 | 초과수익(연) | t | 평균 IC | IC t | 최대 낙폭 | 요인 알파(연) | 알파 t | DSR | 실전 기록 (21일 채점 수 · 평균 초과) | 경제적 가치 |",
@@ -298,7 +339,10 @@ def run(tickers, out_dir=OUT_DIR, say=print):
                 f"  하루 VaR: 95% 예외 {r['VaR 95% 예외 비율']:.1%} (p {r['VaR 95% p값']:.2f}), "
                 f"99% 예외 {r['VaR 99% 예외 비율']:.1%} (p {r['VaR 99% p값']:.2f}) → {r['VaR 검정']} ({r['VaR 검증 일수']:,}일)\n"
                 f"  ES: 손실 비율 95% {r['ES 95% 손실 비율']:.2f}·99% {r['ES 99% 손실 비율']:.2f} "
-                f"(p {r['ES 95% p값']:.2f}·{r['ES 99% p값']:.2f}) → {r['ES 검정']} | GARCH 재적합 실패 {r['GARCH 재적합 실패']} | {r['GARCH 진단']}")
+                f"(p {r['ES 95% p값']:.2f}·{r['ES 99% p값']:.2f}) → {r['ES 검정']} | GARCH 재적합 실패 {r['GARCH 재적합 실패']} | {r['GARCH 진단']}\n"
+                f"  꼬리 분포 비교: 95% 예외 t {r['[t] VaR 95% 예외']:.1%}·FHS {r['[fhs] VaR 95% 예외']:.1%}, "
+                f"99% 예외 t {r['[t] VaR 99% 예외']:.1%}·FHS {r['[fhs] VaR 99% 예외']:.1%}, VaR {r['[t] VaR 검정']}·{r['[fhs] VaR 검정']}, "
+                f"ES {r['[t] ES 검정']}·{r['[fhs] ES 검정']}, 분위수 손실 비율 {r['분위수 손실 비율 (FHS ÷ t)']:.3f}")
         except Exception as e:                    # 한 종목이 실패해도 나머지는 계속
             rows.append({"종목": t, "이름": t, "오류": f"{type(e).__name__}: {str(e)[:200]}"})
             say(f"{t}: 실패 — {rows[-1]['오류']}")
@@ -318,4 +362,5 @@ if __name__ == "__main__":
     t_all = time.time()
     rows = run(["^KS11", "005930.KS"] if smoke else fl.tickers(), say=lambda m: print(m, flush=True))
     print(f"총 {time.time() - t_all:.0f}초, 실패 {sum('오류' in r for r in rows)}종목", flush=True)
+    print("VaR 꼬리 분포 사전 등록 규칙:", var_tail_rule(rows), flush=True)
     sys.exit(1 if all("오류" in r for r in rows) else 0)

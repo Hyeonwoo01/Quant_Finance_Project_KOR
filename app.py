@@ -33,7 +33,7 @@ import repro
 import ui
 import universe as uv
 from quant_engine import GarchVolForecaster, hac_tstat, max_drawdown, timing_attribution, var_backtest, var_es
-from quant_engine import VOL_MODELS, fit_vol_model
+from quant_engine import VAR_INNOV, VAR_INNOVS, VOL_MODELS, fit_vol_model
 
 for _m in _LOCAL_MODULES:                    # 다음 실행 때 파일이 바뀌었는지 비교할 기준
     if _m in sys.modules:
@@ -250,8 +250,10 @@ def get_regime(ticker, cost_bps, lag, use_tax, kind):
 
 @st.cache_data(show_spinner=False)
 def run_var_backtest(returns, model):
-    """하루 VaR 95%·99%의 워크포워드 예외 검정 (Kupiec·Christoffersen). model: 사이드바 변동성 모델."""
-    return var_backtest(np.asarray(returns), model=model)
+    """하루 VaR 95%·99%의 워크포워드 예외 검정 (Kupiec·Christoffersen). model: 사이드바 변동성 모델.
+    꼬리 분포 두 가지(t분포, 실제 잔차 FHS)를 같은 GARCH 적합으로 함께 계산해 한 표로."""
+    both = var_backtest(np.asarray(returns), model=model, innov=tuple(VAR_INNOVS))
+    return pd.concat({VAR_INNOVS[m]: t for m, t in both.items()}, names=["꼬리 분포", "수준"])
 
 
 @st.cache_data(show_spinner=False)
@@ -1145,7 +1147,9 @@ with tab4:
                        "예외일 손실 ÷ 예측 ES는 1에 가까워야 하고, 크면(ES 검정 p값 < 0.05) 꼬리 손실의 크기를 작게 잡은 것입니다. "
                        "분위수 손실은 모델끼리 비교할 때 쓰며 낮을수록 좋습니다. "
                        "최근 약 500일이라 99% VaR는 예외가 5번 정도뿐이어서, 통과해도 극단 손실을 맞힌다는 증거로는 약합니다 — "
-                       "첫 3년 뒤 전체 기간으로 검정한 결과는 실제 데이터 검증 보고서(validation/README.md)에 있습니다.")
+                       "첫 3년 뒤 전체 기간으로 검정한 결과는 실제 데이터 검증 보고서(validation/README.md)에 있습니다. "
+                       f"꼬리 분포: t분포는 좌우 대칭 모수 분포, 실제 잔차(FHS)는 GARCH로 나눈 과거 충격의 실제 분포(하락 쪽이 더 두꺼우면 그대로 반영). "
+                       f"화면의 VaR·ES는 '{VAR_INNOVS[VAR_INNOV]}'을 씁니다 — 바꾸는 규칙은 EXPERIMENTS.md에 미리 적어 두었습니다.")
 
 st.caption(f"재현 정보 — 코드 {repro.code_version()} · 주가 데이터 {repro.fingerprint(close)}"
            + (f" · 방향 예측 데이터 {repro.fingerprint(close_long)}" if p_up is not None else "")
