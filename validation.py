@@ -214,6 +214,7 @@ def ranking_summary(rank_dir=uv.RANK_DIR):
             "변동성 역가중 초과수익(연)": rw["상위20% 초과수익(연, 비용후)"] if rw is not None else np.nan,
             "변동성 역가중 t값": rw["초과수익 t값"] if rw is not None else np.nan,
             "시장 구간별": U.get("market"), "최근1년 제외": U.get("ex_recent"),
+            "리밸런싱 날짜": {h: (w["results"].get((h, 1, True)) or {}).get("offsets") for h in uv.WEEKLY_HOLDS},
             "기준 전략": {uv.MODEL_LABELS[m]: U["table"].loc[m, "상위20% 초과수익(연, 비용후)"]
                        for m in ("momentum", *uv.BASELINES) if m in U["table"].index},
             "초과수익(연, 비용후)": a["상위20% 초과수익(연, 비용후)"], "초과수익 t값": a["초과수익 t값"],
@@ -366,6 +367,11 @@ def report_markdown(rows, rank=None, when="", version="", buckets=None):
         if xr:
             lines.append(f"- 최근 1년을 뺀 결과 (보고만, {xr['끝'].date()}까지 끝난 리밸런싱 {xr['리밸런싱 수']}번): 초과수익 {_pct(xr['초과수익(연)'])} "
                          f"(t {_num(xr['초과수익 t값'], '{:+.1f}')}), 평균 IC {_num(xr['평균 IC'], '{:+.3f}')} (t {_num(xr['IC t값'], '{:+.1f}')})")
+        for h, ofs in (rank.get("리밸런싱 날짜") or {}).items():
+            if ofs:
+                lines.append(f"- 리밸런싱 날짜를 바꾸면 (교체 {h}거래일, 시작일 {len(ofs['table'])}가지, 보고만): " + "; ".join(
+                    f"{uv.MODEL_LABELS[m].replace('⭐ ', '')} 초과수익 평균 {_pct(sm['평균'])} ({_pct(sm['최소'])} ~ {_pct(sm['최대'])}), "
+                    f"0보다 큰 경우 {sm['0보다 큰 수']}/{sm['시작일 수']}" for m, sm in ofs["summary"].items()))
         mk = rank.get("시장 구간별")
         if mk is not None:
             lines += ["", "| 시장 구간 (리밸런싱 기간의 범위 평균 수익률 3분위) | 기간 수 | 시장 평균 | 초과수익 평균 | 초과 > 0 비율 |", "|---|---|---|---|---|"]

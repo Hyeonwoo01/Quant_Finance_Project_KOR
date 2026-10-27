@@ -285,6 +285,20 @@ assert _dr["리밸런싱 수"] == len(_kp) < len(_exu) and np.isclose(_dr["초�
 _mb = uv.market_breakdown(uv.evaluate(wf_u, 5)[1])
 assert list(_mb.index) == ["하락", "횡보", "상승"] and _mb["기간 수"].sum() == tab.loc["auto", "리밸런싱 수"]
 assert _mb["시장 평균(기간)"].is_monotonic_increasing
+# 리밸런싱 날짜 바꿔 보기: 시작일만 o거래일 늦고 간격은 그대로 h (마지막 = 오늘의 추천은 같음). 옮김 0 = 기본 계산
+assert uv.offsets_for(21) == [0, 4, 8, 13, 17] and uv.offsets_for(63) == [0, 13, 25, 38, 50]
+_wfo = uv.walk_forward(pa, h=21, train_years=1, refit_models=("ridge",), offset=8)
+_ixa = pa["close"].index
+assert _ixa.get_loc(_wfo["rebal"][0]) == _ixa.get_loc(wf_u["rebal"][0]) + 8
+assert all(_ixa.get_loc(b) - _ixa.get_loc(a) == 21 for a, b in zip(_wfo["rebal"][:-2], _wfo["rebal"][1:-1]))
+assert _wfo["rebal"][-1] == wf_u["rebal"][-1] == _ixa[-1]
+_ot = uv.offset_table({8: _wfo, 0: wf_u}, 5)
+assert list(_ot["table"].index) == [0, 8] and set(_ot["summary"]) == {"auto", "momentum"}
+assert np.isclose(_ot["table"].loc[0, "auto 초과수익(연)"], uv.evaluate(wf_u, 5)[0].loc["auto", "상위20% 초과수익(연, 비용후)"])
+assert np.isclose(_ot["table"].loc[8, "momentum t값"], uv.evaluate(_wfo, 5)[0].loc["momentum", "초과수익 t값"])
+_so = _ot["summary"]["auto"]
+assert _so["시작일 수"] == 2 and _so["최소"] <= _so["평균"] <= _so["최대"] and 0 <= _so["0보다 큰 수"] <= 2
+assert np.isclose(_so["평균"], _ot["table"]["auto 초과수익(연)"].mean())
 # 위험 반영 비중: 변동성 역수에 비례, 종목당 동일 비중의 2배 상한, 합 1. 변동성 자료가 없으면 동일 비중
 _wv = {"vol": pd.DataFrame([[0.01, 0.02, 0.04, 0.08]], columns=list("abcd"), index=[0])}
 _ww = uv._weights(list("abcd"), 0, _wv, "inv_vol")
@@ -943,6 +957,13 @@ with tempfile.TemporaryDirectory() as _td:
     _rk = _vdr.ranking_summary(_td)
     _mdr = _vdr.report_markdown([], _rk, "2026-10-26", "test")
     assert "손익분기 비용" in _mdr and "자동 선택이 바뀐 횟수" in _mdr and "기준 전략" in _mdr
+    # 리밸런싱 날짜 바꿔 보기: 앱 기본 체결(다음 날)에서만, 교체 주기마다 시작일 5가지 → 보고서 줄까지
+    assert all("offsets" not in _wres[(h, 0, t)] for h in uv.WEEKLY_HOLDS for t in (True, False))
+    for _h in uv.WEEKLY_HOLDS:
+        _of = _wres[(_h, 1, True)]["offsets"]
+        assert list(_of["table"].index) == uv.offsets_for(_h) and _of["summary"]["auto"]["시작일 수"] == 5
+        assert _of["table"].loc[0, "리밸런싱 수"] == _wres[(_h, 1, True)]["table"].loc["auto", "리밸런싱 수"]
+    assert _mdr.count("리밸런싱 날짜를 바꾸면") == len(uv.WEEKLY_HOLDS)
 
 # ---------------- 한국판 요인 (파마-프렌치 방식의 근사) ----------------
 # 심어 둔 구조: 시가총액이 작을수록, 장부가/시총이 클수록 매일 조금 더 오른다 → 소형주·가치 요인이 양(+)으로 나와야
