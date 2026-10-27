@@ -265,6 +265,18 @@ _tr = uv.target_rank(_fw, _uv).iloc[0]
 assert np.allclose(_tr[["a", "c"]].values, [0.5, 0.0]) and np.isnan(_tr["b"]) and np.isnan(_tr["d"])   # a·c 둘 중 순위
 assert uv.cross_rank(_fw, _uv).iloc[0]["b"] == 0.0
 
+# 시총 순위 목록: 쪽을 넘기는 사이 순위가 바뀌어(시간외 거래 등) 같은 종목이 두 쪽에 나와도 한 번만 — 처음(높은 순위) 것
+_st = lambda c, nm, kind="stock": {"itemCode": c, "stockName": nm, "stockEndType": kind, "marketValueRaw": "1000", "closePriceRaw": "10"}
+_pages = {1: [_st("000010", "가"), _st("000020", "나")],
+          2: [_st("000020", "나"), _st("000030", "다"), _st("000040", "라ETF", "etf"), _st("000050", "마우")]}
+_get0 = uv.requests.get
+uv.requests.get = lambda url, **kw: __import__("types").SimpleNamespace(json=lambda: {"stocks": _pages.get(int(url.split("page=")[1].split("&")[0]), [])})
+try:
+    _fc = uv.fetch_candidates()
+finally:
+    uv.requests.get = _get0
+assert list(_fc["code"]) == ["000010", "000020", "000030"] and list(_fc["cap_rank"]) == [1, 2, 3] and np.allclose(_fc["shares"], 100)
+
 pa = synth_panel(5)
 wf_u = uv.walk_forward(pa, h=21, train_years=1, refit_models=("ridge",))
 tab, _ = uv.evaluate(wf_u, cost_bps=0)
