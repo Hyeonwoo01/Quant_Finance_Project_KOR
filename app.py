@@ -800,6 +800,22 @@ with tab_pick:
                 st.dataframe(mk.style.format({"기간 수": "{:.0f}", "시장 평균(기간)": "{:+.1%}", "초과수익 평균(기간)": "{:+.2%}",
                                               "초과 > 0 비율": "{:.0%}"}, na_rep="—"), width="stretch")
                 st.caption("특정 시장(예: 상승장)에서만 초과수익이 났다면 그 신호는 시장 상황에 기대는 것일 수 있습니다. 기간 수가 적어 참고용입니다.")
+            ofs = U.get("offsets")
+            if ofs is not None:
+                st.markdown(f"**리밸런싱 날짜를 바꾸면?** — 교체 주기 {hold}거래일 안에서 시작일을 {len(ofs['table'])}가지로 옮겨 처음부터 다시 계산")
+                ot = ofs["table"].rename(columns=lambda c: c.replace("auto", "자동 선택").replace("momentum", "모멘텀"))
+                pct_cols = [c for c in ot.columns if c.endswith("초과수익(연)")]
+                st.dataframe(ot.style.format({"첫 리밸런싱": lambda d: f"{pd.Timestamp(d).date()}", "리밸런싱 수": "{:.0f}",
+                                              **{c: "{:+.1%}" for c in pct_cols},
+                                              **{c: _signed(1) for c in ot.columns if c.endswith("t값")},
+                                              **{c: "{:+.3f}" for c in ot.columns if c.endswith("IC")}}, na_rep="—"),
+                             width="stretch")
+                sm = ofs["summary"]
+                st.caption(" · ".join(f"{uv.MODEL_LABELS[m].replace('⭐ ', '')}: 평균 {s['평균']:+.1%} "
+                                      f"(최소 {s['최소']:+.1%} ~ 최대 {s['최대']:+.1%}), 0보다 큰 경우 {s['0보다 큰 수']}/{s['시작일 수']}"
+                                      for m, s in sm.items())
+                           + ". 위 표의 기본 결과는 시작일 옮김 0입니다. 시작일만 바꿨는데 성적이 크게 달라진다면 결과가 "
+                             "'날짜를 잘 고른 운'에 기대고 있다는 뜻이라 평균과 범위를 함께 봐야 합니다 (보고만, 판정 기준은 그대로).")
             rk = U.get("risk")
             if rk is not None:
                 st.markdown(f"**지금 고른 {rk['n']}종목을 같은 비중으로 들고 있으면?** — 지난 {rk['days']}거래일 동안 그대로 들고 있었다고 보고 계산")

@@ -363,12 +363,13 @@ def composite_score(R, date, universe, cols):
 
 
 def walk_forward(panel, h=21, train_years=2, sample_every=5, refit_models=("ridge", "gbm"), progress=None,
-                 exec_lag=1):
+                 exec_lag=1, offset=0):
     """매 h일 리밸런싱. 각 시점 t에선 결과가 확정된(날짜 ≤ t−h−exec_lag) 데이터로만 학습·선택한다.
 
     exec_lag: t일 종가까지 보고 고른 뒤 실제로 사고파는 시점까지의 거래일 수.
               1(기본) = 다음 날 종가에 체결 → 성적은 t+1일 종가부터 h일 수익률로 매긴다. 0 = t일 종가에 체결(낙관적).
     학습 목표도 같은 '체결 이후 h일 수익률'의 순위다 — 판단일 t → t+1 종가처럼 실제로는 얻을 수 없는 하루를 배우지 않도록.
+    offset: 첫 리밸런싱을 며칠 늦출지 (리밸런싱 날짜를 바꿔 결과가 날짜 운인지 볼 때, offset_table).
     """
     F, close, universe = panel["feat"], panel["close"], panel["universe"]
     cols = [c for c in FEATURES if panel["coverage"].get(c, 0) > 0.3]       # 데이터가 너무 빈 신호는 제외
@@ -377,7 +378,7 @@ def walk_forward(panel, h=21, train_years=2, sample_every=5, refit_models=("ridg
     Y = target_rank(fwd_exec, universe)                                      # 학습 목표 = 채점 대상: 체결 이후 수익률 '순위'
     idx = close.index
     first = universe.any(axis=1).values.argmax() + 252 * train_years
-    rebal = list(range(first, len(idx), h))
+    rebal = list(range(first + offset, len(idx), h))
     if rebal and rebal[-1] != len(idx) - 1:
         rebal.append(len(idx) - 1)                                            # 마지막 = 오늘의 추천
 
@@ -569,6 +570,38 @@ def drop_recent(wf, curves, model="auto", days=RECENT_DAYS):
     return {"끝": idx[cut], "리밸런싱 수": len(keep), "초과수익(연)": float(x.mean() * 252 / wf["h"]),
             "초과수익 t값": hac_tstat(x.values), "평균 IC": float(ic.mean()) if len(ic) else np.nan,
             "IC t값": hac_tstat(ic.values)}
+
+
+OFFSET_PARTS = 5          # 리밸런싱 날짜 바꿔 보기: 교체 주기 안에서 시작일을 다섯 가지로 (EXPERIMENTS.md 사전 등록)
+
+
+def offsets_for(h, parts=OFFSET_PARTS):
+    """교체 주기 h 안에서 고르게 옮긴 시작일들: 0, h/parts, 2h/parts, … (반올림, 중복 제거)."""
+    return sorted({int(round(k * h / parts)) for k in range(parts)})
+
+
+def offset_table(wfs, cost_bps=5.0, sell_tax=False, models=("auto", "momentum")):
+    """시작일만 다른 워크포워드들 {offset: wf} → 시작일별 성적과 요약. 결과가 리밸런싱 날짜 운에 기대는지 본다 (보고용).
+    반환: dict(table = 시작일 × (모델별 초과수익·t값·IC), summary = 모델별 평균·최소·최대·초과수익 > 0인 수)."""
+    rows = {}
+    for o, wf in sorted(wfs.items()):
+        tab = evaluate(wf, cost_bps, sell_tax=sell_tax, models=list(models))[0]
+        row = {"첫 리밸런싱": wf["rebal"][0], "리밸런싱 수": tab["리밸런싱 수"].iloc[0]}
+        for m in models:
+            if m in tab.index:
+                row.update({f"{m} 초과수익(연)": tab.loc[m, "상위20% 초과수익(연, 비용후)"], f"{m} t값": tab.loc[m, "초과수익 t값"],
+                            f"{m} IC": tab.loc[m, "평균 IC"]})
+        rows[o] = row
+    table = pd.DataFrame.from_dict(rows, orient="index")
+    table.index.name = "시작일 옮김(거래일)"
+    summary = {}
+    for m in models:
+        c = f"{m} 초과수익(연)"
+        if c in table:
+            x = table[c].astype(float)
+            summary[m] = {"평균": float(x.mean()), "최소": float(x.min()), "최대": float(x.max()), "0보다 큰 수": int((x > 0).sum()),
+                          "시작일 수": int(x.notna().sum())}
+    return {"table": table, "summary": summary}
 
 
 def market_breakdown(curves, model="auto"):
@@ -968,8 +1001,16 @@ def weekly(update=True, panel=None, out_dir=RANK_DIR, now=None, refit_models=("r
     for j, (h, lag) in enumerate(combos):
         say(j / len(combos), f"계산: 교체 주기 {h}거래일, 체결 {'다음 날' if lag else '그날'} 종가")
         wf = walk_forward(panel, h, refit_models=refit_models, exec_lag=lag)
+        # 앱 기본 체결(다음 날)에서는 리밸런싱 시작일을 바꿔 다시 계산 — 결과가 날짜 운인지 (보고만, EXPERIMENTS.md)
+        wfs = {0: wf}
+        if lag == RECORD_LAG:
+            for o in offsets_for(h)[1:]:
+                say(j / len(combos), f"  리밸런싱 시작일 {o}거래일 옮겨 다시 계산 (교체 주기 {h})")
+                wfs[o] = walk_forward(panel, h, refit_models=refit_models, exec_lag=lag, offset=o)
         for tax in (True, False):
             res[(h, lag, tax)] = results(panel, wf, WEEKLY_COST, tax)
+            if len(wfs) > 1:
+                res[(h, lag, tax)]["offsets"] = _optional(offset_table, wfs, WEEKLY_COST, tax)
         if (h, lag) == (RECORD_HOLD, RECORD_LAG):
             rec = wf
     pd.to_pickle({"updated": pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d %H:%M"),
