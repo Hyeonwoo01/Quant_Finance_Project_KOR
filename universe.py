@@ -64,16 +64,18 @@ BASELINES = {"lowvol": ("vol_63", -1), "value": ("bm", +1)}
 def fetch_candidates(n=None):
     """네이버 증권 코스피 시가총액 순위의 보통주 전체(또는 상위 n개). ETF·ETN·우선주 제외.
 
-    shares = 현재 시가총액 ÷ 현재가 (가치 지표의 시가총액 계산용), cap_rank = 현재 시총 순위."""
-    out, page = [], 1
+    shares = 현재 시가총액 ÷ 현재가 (가치 지표의 시가총액 계산용), cap_rank = 현재 시총 순위.
+    쪽을 넘기는 사이 순위가 바뀌면(장 마감 뒤 시간외 거래 등) 같은 종목이 두 쪽에 나올 수 있어 처음 나온 것만 쓴다."""
+    out, seen, page = [], set(), 1
     while (n is None or len(out) < n) and page <= 40:
         js = requests.get(f"https://m.stock.naver.com/api/stocks/marketValue/KOSPI?page={page}&pageSize=100",
                           headers=UA, timeout=10).json()
         if not js.get("stocks"):
             break
         for s in js["stocks"]:
-            if (s["stockEndType"] == "stock" and s["itemCode"].endswith("0")
+            if (s["stockEndType"] == "stock" and s["itemCode"].endswith("0") and s["itemCode"] not in seen
                     and not re.search(r"\d?우[A-Z]?$|우\(", s["stockName"])):
+                seen.add(s["itemCode"])
                 cap, px = float(s.get("marketValueRaw") or 0), float(s.get("closePriceRaw") or 0)
                 out.append((s["itemCode"], s["stockName"], cap / px if px > 0 else np.nan))
         page += 1
@@ -245,7 +247,7 @@ def build_panel(top_n=TOP_N, cap_limit=None, end=None):
 
     cap_limit: 비교용. 주면 '현재 시총 상위 cap_limit개' 안에서만 고른다 (= 예전 방식, 생존 편향 있음).
     end: 이 날짜까지만 쓴다 (장중에 받은 '오늘' 가격을 빼고 계산할 때)."""
-    cands = pd.read_pickle(UDIR / "candidates.pkl")
+    cands = pd.read_pickle(UDIR / "candidates.pkl").drop_duplicates("code")     # 예전에 받은 목록의 중복 대비 (fetch_candidates)
     pr = pd.read_pickle(UDIR / "prices.pkl")
     close, volume = pr["close"], pr["volume"]
     close_raw = pr.get("close_raw", close)
