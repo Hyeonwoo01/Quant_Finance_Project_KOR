@@ -481,6 +481,26 @@ LR_{\text{POF}} = -2\ln\frac{(1-p)^{n-x}p^{x}}{(1-\hat\pi)^{n-x}\hat\pi^{x}} \si
 지수는 FHS가 조금 나았지만(코스피 95% 예외 7.0% → 6.1%) 여전히 기각이고, 개별 종목은 750개 잔차로 정하는 99% 분위수가 흔들려 예외가 늘었습니다.
 코드: `GarchVolForecaster.tail`, `simulate(innov=)`, `var_backtest(innov=)`, `VAR_INNOV` (`quant_engine.py`), `var_tail_rule` (`validation.py`).
 
+### σ 보정: VKOSPI 섞기 · 크기 재보정
+진단(`var_study.py`, [EXPERIMENTS.md](EXPERIMENTS.md))에서 지수의 문제는 꼬리 모양보다 σ의 크기였습니다.
+검증 구간에서 실제 분산이 예측보다 23~28% 컸고, 학습 구간 안의 표준화 잔차는 분산 1로 맞았습니다.
+그래서 같은 GARCH 예측 $`\sigma_t`$에 날짜별 배수 $`c_t`$를 곱하는 두 후보를 결과를 보기 전에 등록했습니다(꼬리 분포는 그대로, VaR·ES 모두 $`c_t`$배).
+
+- **VKOSPI 섞기 (코스피 지수·KODEX 200)**: 옵션 가격에 담긴 앞으로의 변동성(VKOSPI, 연율 %)을 반반 섞습니다. 전날 종가 값을 쓰므로 미래 정보가 없습니다.
+
+```math
+\tilde\sigma_t^2 = \tfrac12\,\sigma_{t}^2 + \tfrac12\,\frac{(\mathrm{VKOSPI}_{t-1}/100)^2}{252}, \qquad c_t = \tilde\sigma_t / \sigma_t
+```
+
+- **크기 재보정 (모든 종목)**: 예측 σ가 꾸준히 작거나 크면 지난 성적만큼 고칩니다. 지난 250일의 표준화 수익률 $`z_s = r_s/\sigma_s`$로 계산하고, 그날은 넣지 않습니다.
+
+```math
+c_t = \mathrm{clip}\Big(\sqrt{\tfrac{1}{250}\textstyle\sum_{s=t-250}^{t-1} z_s^2},\ 0.8,\ 1.5\Big) \quad (\text{지난 날이 125일 미만이면 } c_t = 1)
+```
+
+판정은 분위수 손실 비율(후보 ÷ 기본)을 전체·앞 절반·뒤 절반으로 나눠 보고, VaR·ES 검정 통과 수가 줄지 않는지로 합니다(규칙은 EXPERIMENTS.md).
+코드: `var_rescale`, `recal_factor`, `iv_blend_factor` (`quant_engine.py`), `vkospi` (`kr_data.py`), `var_scale_rule` (`validation.py`).
+
 ### ES 검정 (예외일 손실의 크기)
 예외 '횟수'가 맞아도 넘을 때 얼마나 크게 넘는지는 따로 봐야 합니다. 예측 ES는 분산이 1인 충격 분포의 꼬리 평균에 그날 변동성을 곱한 값입니다
 (t분포: $`\mathrm{ES}_p = \sigma_t \, \frac{f_\nu(q)}{p}\,\frac{\nu + q^2}{\nu - 1}\sqrt{\frac{\nu-2}{\nu}}`$, $`q = F_\nu^{-1}(p)`$).

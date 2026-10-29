@@ -34,11 +34,24 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: 받아 둔 KRX 파생상품지수(VKOSPI) 불러오기 (Actions 캐시)
+        uses: actions/cache/restore@v4
+        with:
+          path: cache/krx
+          key: krx-drv-${{ github.run_id }}
+          restore-keys: krx-drv-
       - name: 검증 (푸시일 때는 두 종목만)
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
           ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
+          KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
         run: python validation.py ${{ github.event_name == 'push' && '--smoke' || '' }}
+      - name: 받은 VKOSPI 저장
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cache/krx
+          key: krx-drv-${{ github.run_id }}
       - name: 결과 커밋
         if: github.event_name != 'push'
         run: |

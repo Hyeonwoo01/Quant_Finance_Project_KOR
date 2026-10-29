@@ -1,0 +1,49 @@
+name: var-study
+
+# 하루 VaR 진단 (보고만): 코스피 지수 VaR가 위험을 작게 잡는 이유를 실제 데이터로 쪼개 보고 로그에 남긴다 (var_study.py).
+# 저장·커밋 없음. 진단 코드가 바뀐 푸시(main 제외)와 수동 실행에서 돈다.
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore: [main]
+    paths:
+      - var_study.py
+      - .github/workflows/var-study.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: var-study
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  study:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 받아 둔 KRX 파생상품지수 불러오기 (Actions 캐시)
+        uses: actions/cache/restore@v4
+        with:
+          path: cache/krx
+          key: krx-drv-${{ github.run_id }}
+          restore-keys: krx-drv-
+      - name: 진단
+        env:
+          KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
+        run: python var_study.py
+      - name: 받은 데이터 저장
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cache/krx
+          key: krx-drv-${{ github.run_id }}
