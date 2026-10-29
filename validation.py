@@ -29,8 +29,8 @@ import market_data as md
 import regime as rg
 import repro
 import universe as uv
-from quant_engine import (VAR_INNOV, VAR_INNOVS, block_bootstrap_ci, fit_vol_model, iv_blend_factor, recal_factor,
-                          var_backtest, var_rescale)
+from quant_engine import (VAR_INNOV, VAR_INNOVS, VAR_IV_TICKERS, block_bootstrap_ci, fit_vol_model, iv_blend_factor,
+                          recal_factor, var_backtest, var_rescale)
 
 OUT_DIR = Path(__file__).parent / "validation"
 H, COST_BPS, LAG = 21, 3.0, 1          # 앱 기본 설정 (방향 예측 기간, 수수료·체결 비용 bp, 다음 날 종가 체결)
@@ -39,7 +39,7 @@ VAR_START = 756                        # 하루 VaR 검증 시작 위치: 첫 3�
 INDEX_NAMES = {"^KS11": "코스피 지수", "^KQ11": "코스닥 지수", "^KS200": "코스피 200 지수"}
 # 하루 VaR σ 보정 두 후보 (EXPERIMENTS.md 사전 등록 2026-10-29): 같은 GARCH 예측에 날짜별 배수만 곱해 다시 채점
 VAR_SCALES = {"recal": "크기 재보정 (C2)", "vkospi": "VKOSPI 섞기 (C1)"}
-VKOSPI_TICKERS = ("^KS11", "069500.KS")  # 코스피 200을 따르는 종목만 VKOSPI 섞기 대상
+VKOSPI_TICKERS = VAR_IV_TICKERS          # 코스피 200을 따르는 종목만 VKOSPI 섞기 대상 (2026-10-29 판정으로 이 종목들의 기본)
 
 
 def _ann(x):
@@ -199,6 +199,10 @@ def validate(ticker):
         row[f"분위수 손실 비율 ({m} ÷ 기본)"] = _ql(d) / _ql(vd)
         for (part, dp), (_, bp) in zip(_halves(d), _halves(vd)):
             row[f"분위수 손실 비율 ({m} ÷ 기본) {part}"] = _ql(dp) / _ql(bp)
+    # 채택된 보정 (2026-10-29 판정): 코스피 200 종목의 본 표는 VKOSPI를 섞은 VaR. 비교 열([t]·[recal]·[vkospi])은 위에서 이미 기록
+    row["VaR σ 보정"] = "VKOSPI 섞기" if ticker in VKOSPI_TICKERS and "vkospi" in factors else "없음"
+    if row["VaR σ 보정"] != "없음":
+        vt, vd = var_rescale(vt, vd, factors["vkospi"])
     # 앞·뒤 절반 각각의 분위수 손실 비율 (보고만 — 최근 급등락 구간에만 기대는지)
     for part, sl in (("앞 절반", slice(None, len(both["t"][1]) // 2)), ("뒤 절반", slice(len(both["t"][1]) // 2, None))):
         ql = {m: sum(_quantile_loss(d.iloc[sl], lv) for lv in (0.95, 0.99)) for m, (_, d) in both.items()}
@@ -391,11 +395,12 @@ def report_markdown(rows, rank=None, when="", version="", buckets=None):
                      f"[{_pct(r['국면 초과 95% 하한'])}, {_pct(r['국면 초과 95% 상한'])}] | {r['국면 전략 경제적 가치']} |")
     lines += ["", "## 하루 VaR·ES 검정 (첫 3년 학습 뒤 전체 기간)", "",
               "예외 = 실제 손실이 VaR보다 컸던 날. 손실 비율 = 예외일의 실제 손실 ÷ 예측 ES (1에 가까워야 하고, 크면 꼬리 손실을 작게 잡은 것). "
-              "앞·뒤 절반 = 검증 기간을 반으로 나눈 95% 예외 비율 (시기에 따라 흔들리는지).", "",
+              "앞·뒤 절반 = 검증 기간을 반으로 나눈 95% 예외 비율 (시기에 따라 흔들리는지). "
+              "코스피 지수·KODEX 200은 앱·기록과 같이 GARCH와 전날 VKOSPI를 반반 섞은 σ로 계산합니다 (2026-10-29 판정, 이름 옆 *).", "",
               "| 종목 | 검증 일수 | 95% 예외 (목표 5%) | p값 | 99% 예외 (목표 1%) | p값 | VaR 결과 | ES 손실 비율 95% · 99% | ES p값 95% · 99% | ES 결과 | 95% 예외 앞·뒤 절반 |",
               "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in ok:
-        lines.append(f"| {r['이름']} | {r['VaR 검증 일수']:,} | {_pct(r['VaR 95% 예외 비율'], False)} | {_num(r['VaR 95% p값'], '{:.2f}')} | "
+        lines.append(f"| {r['이름']}{' *' if r.get('VaR σ 보정', '없음') != '없음' else ''} | {r['VaR 검증 일수']:,} | {_pct(r['VaR 95% 예외 비율'], False)} | {_num(r['VaR 95% p값'], '{:.2f}')} | "
                      f"{_pct(r['VaR 99% 예외 비율'], False)} | {_num(r['VaR 99% p값'], '{:.2f}')} | {r['VaR 검정']} | "
                      f"{_num(r['ES 95% 손실 비율'], '{:.2f}')} · {_num(r['ES 99% 손실 비율'], '{:.2f}')} | "
                      f"{_num(r['ES 95% p값'], '{:.2f}')} · {_num(r['ES 99% p값'], '{:.2f}')} | {r['ES 검정']} | "

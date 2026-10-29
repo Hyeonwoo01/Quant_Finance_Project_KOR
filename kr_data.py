@@ -392,6 +392,17 @@ def vkospi(dates, workers=4):
     return s, sorted({n for _, n in res if n})
 
 
+def vkospi_on(day):
+    """그날 종가의 VKOSPI (연율 %). KRX 키가 없거나, 그날 값이 없거나, 받지 못하면 NaN."""
+    if not get_key("KRX_API_KEY"):
+        return np.nan
+    try:
+        v, _ = vkospi([day], workers=1)
+        return float(v.iloc[0])
+    except Exception:
+        return np.nan
+
+
 def krx_stock_day(day, market="STK"):
     """그날 상장돼 있던 전 종목의 일별매매정보 (나중에 상장폐지된 종목도 그날엔 들어 있다 → 생존 편향 없는 종목 범위).
 

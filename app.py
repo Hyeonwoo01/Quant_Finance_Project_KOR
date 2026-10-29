@@ -33,7 +33,7 @@ import repro
 import ui
 import universe as uv
 from quant_engine import GarchVolForecaster, hac_tstat, max_drawdown, timing_attribution, var_backtest, var_es
-from quant_engine import VAR_INNOV, VAR_INNOVS, VOL_MODELS, fit_vol_model
+from quant_engine import VAR_INNOV, VAR_INNOVS, VAR_IV_TICKERS, VOL_MODELS, fit_vol_model, iv_blend_factor
 
 for _m in _LOCAL_MODULES:                    # 다음 실행 때 파일이 바뀌었는지 비교할 기준
     if _m in sys.modules:
@@ -249,6 +249,12 @@ def get_regime(ticker, cost_bps, lag, use_tax, kind):
 
 
 @st.cache_data(show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_vkospi(day):
+    """그날 종가의 VKOSPI (KRX, 키가 없거나 받지 못하면 NaN) — 코스피 200 종목의 하루 VaR σ 보정에 쓴다."""
+    return kr_data.vkospi_on(day)
+
+
 def run_var_backtest(returns, model):
     """하루 VaR 95%·99%의 워크포워드 예외 검정 (Kupiec·Christoffersen). model: 사이드바 변동성 모델.
     꼬리 분포 두 가지(t분포, 실제 잔차 FHS)를 같은 GARCH 적합으로 함께 계산해 한 표로."""
@@ -331,6 +337,9 @@ garch = fit_vol_model(rets.values, vol_model)
 rv_h = garch.forecast_vol(horizon)
 
 sims = garch.simulate(horizon)                                      # (경로, 일) 누적 로그수익률 — 요약 카드와 1번 탭에서 같이 씀
+# 하루 VaR: 코스피 200을 따르는 종목은 GARCH와 마지막 종가일의 VKOSPI를 반반 섞은 σ (EXPERIMENTS.md 2026-10-29 판정)
+vk_last = get_vkospi(close.index[-1]) if ticker in VAR_IV_TICKERS else np.nan
+day1 = float(iv_blend_factor([np.sqrt(garch.sigma2_next)], [vk_last])[0]) * sims[:, 0]
 kind = get_tax_kind(ticker)
 tax_on = use_tax and kind in ("KOSPI", "KOSDAQ")
 cost_word = f"수수료·체결 비용 {cost_bps:g}bp" + (" + 증권거래세" if tax_on else "")
@@ -342,7 +351,7 @@ def show_hero(dir_metric):
     name = dict(matches).get(ticker, ticker)
     with hero_slot.container():
         lo68, hi68 = spot * np.exp(np.quantile(sims[:, -1], [0.16, 0.84]))
-        v95 = var_es(sims[:, 0], 0.95)[0]
+        v95 = var_es(day1, 0.95)[0]
         ui.hero("KOSPI · KOSDAQ", name, price_fmt(spot), close.pct_change().iloc[-1],
                 [("기준일", close.index[-1].date()), ("학습 데이터", f"{years}년"), ("구분", kc.KIND_LABELS[kind])],
                 [(f"예측 변동성 · {horizon}일", f"{rv_h:.1%}",
@@ -415,7 +424,7 @@ with tab1:
 
     st.subheader("손실 위험 (VaR · ES)")
     hist_h = np.log(close).diff(horizon).dropna().values           # 학습 기간의 실제 h일 수익률 (겹침)
-    risk = {"1d95": var_es(sims[:, 0], 0.95), "1d99": var_es(sims[:, 0], 0.99), "h95": var_es(sims[:, -1], 0.95)}
+    risk = {"1d95": var_es(day1, 0.95), "1d99": var_es(day1, 0.99), "h95": var_es(sims[:, -1], 0.95)}
     past = {"1d95": var_es(rets.values, 0.95), "1d99": var_es(rets.values, 0.99),
             "h95": var_es(hist_h, 0.95) if len(hist_h) >= 100 else (np.nan, np.nan)}
     v1, v2, v3, v4 = st.columns(4)
@@ -427,7 +436,12 @@ with tab1:
               help="최악 5% 경우의 평균 손실")
     st.caption(f"VaR 95%는 '100번 중 95번은 손실이 이보다 작다'는 뜻입니다. 예를 들어 1,000만 원어치를 들고 있다면 "
                f"하루에 약 {risk['1d95'][0] * 1e7:,.0f}원 넘게 잃을 확률이 5%입니다. ES는 그 나머지 최악 5% 경우의 평균 손실입니다. "
-               f"큰 값은 t분포 {garch.name}(꼬리 두께 ν = {garch.nu:.1f}) 시뮬레이션, '과거 실제'는 학습 기간({years}년)의 실제 수익률로 계산했습니다.")
+               f"큰 값은 t분포 {garch.name}(꼬리 두께 ν = {garch.nu:.1f}) 시뮬레이션, '과거 실제'는 학습 기간({years}년)의 실제 수익률로 계산했습니다."
+               + ((f" 하루 VaR는 GARCH 변동성과 VKOSPI({close.index[-1].date()} 종가 {vk_last:.1f})를 반반 섞은 변동성으로 계산합니다 — "
+                   "GARCH만으로는 이 지수의 하루 손실 위험을 꾸준히 작게 잡아, 미리 정한 규칙으로 검증해 바꿨습니다 (EXPERIMENTS.md)."
+                   if np.isfinite(vk_last) else
+                   " VKOSPI를 받지 못해 하루 VaR는 GARCH만으로 계산했습니다 (이 지수는 GARCH만으로 위험을 작게 잡는 경향이 있습니다).")
+                  if ticker in VAR_IV_TICKERS else ""))
 
 # ---------------- 방향 예측 ----------------
 with tab_dir:
