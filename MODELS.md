@@ -509,6 +509,8 @@ c_t = \mathrm{clip}\Big(\sqrt{\tfrac{1}{250}\textstyle\sum_{s=t-250}^{t-1} z_s^2
 **예외 몰림(2026-10-29)**: 섞은 뒤에도 코스피 지수 99% VaR는 예외가 이틀 연속 나온 급락 구간 때문에 독립성 검정에서 기각됩니다.
 큰 하락 다음 날 σ가 덜 반응하는 만큼 전날 움직임 구간별로 다시 맞추는 후보(`cond_recal_factor`)를 사전 등록해 시험했습니다.
 몰림은 줄었지만(독립성 p 0.010 → 0.054) 분위수 손실이 나빠져 채택하지 않았습니다(`var_cluster_rule`).
+같은 방식으로 휴장 뒤 첫 거래일(월요일·연휴 다음 날)만 따로 맞추는 후보(`group_recal_factor`, `after_break`)도 시험했습니다.
+그날의 예외는 줄었지만(종목 평균 6.6% → 5.3%) 분위수 손실이 나아지지 않아(코스피 1.000, 종목 중앙값 1.011) 채택하지 않았습니다.
 코드: `var_rescale`, `recal_factor`, `iv_blend_factor` (`quant_engine.py`), `vkospi` (`kr_data.py`), `var_scale_rule` (`validation.py`).
 
 ### ES 검정 (예외일 손실의 크기)
