@@ -838,13 +838,14 @@ try:
     _base = fl.predict("SPY")
     assert np.isnan(_base["var_vkospi"])                              # 대상 종목이 아니면 섞지 않음
     _ivt0, _vko0 = fl.VAR_IV_TICKERS, kr_data.vkospi_on
-    fl.VAR_IV_TICKERS, kr_data.vkospi_on = ("SPY",), lambda d: 200.0
+    fl.VAR_IV_TICKERS, kr_data.vkospi_on = ("SPY",), lambda d: 40.0
     try:
         _bl = fl.predict("SPY")
     finally:
         fl.VAR_IV_TICKERS, kr_data.vkospi_on = _ivt0, _vko0
+    # 로그수익률 분위수가 같은 배수 (VaR는 단순 수익률이라 분위수 보간 때문에 1e-8 정도 어긋남)
     _c95, _c99 = (np.log1p(-_bl[k]) / np.log1p(-_base[k]) for k in ("var95_1d", "var99_1d"))
-    assert _bl["var_vkospi"] == 200.0 and _c95 > 1 and np.isclose(_c95, _c99, rtol=1e-9) and _bl["lo68"] == _base["lo68"]
+    assert _bl["var_vkospi"] == 40.0 and _c95 > 1 and np.isclose(_c95, _c99, rtol=1e-6) and np.isclose(_bl["lo68"], _base["lo68"])
     # 시장 심리 지표도 앱과 같은 값으로 저장 (뉴스는 가장 최근 헤드라인 기준 7일: 1/20 하나만)
     assert _row["pc_oi"] == 1.5 and _row["eps_rev_30d"] == 0.01 and _row["news_7d"] == 0.25 and _row["news_n"] == 1
 finally:
