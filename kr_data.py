@@ -357,9 +357,10 @@ def krx_drv_index_day(day):
 
 
 def is_vkospi(name):
-    """지수 이름이 VKOSPI(코스피 200 변동성지수)인가. 그 지수를 따르는 선물지수 등은 뺀다."""
-    n = str(name).replace(" ", "")
-    return "200" in n and "변동성" in n and not any(k in n for k in ("선물", "코스닥", "레버리지", "인버스"))
+    """지수 이름이 VKOSPI(코스피 200 변동성지수) 그 자체인가. '코스피 200 가치저변동성'·'변동성매칭 양매도지수' 같은
+    이름이 비슷한 지수는 아니다 (KRX 파생상품지수 표에 함께 있다)."""
+    n = str(name).replace(" ", "").upper()
+    return n in ("코스피200변동성지수", "VKOSPI", "V-KOSPI200")
 
 
 def vkospi(dates, workers=4):

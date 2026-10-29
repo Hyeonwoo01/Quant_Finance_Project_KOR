@@ -424,8 +424,10 @@ assert _kr.loc[0, "cap"] == 4.25e14 and _kr.loc[0, "shares"] == 5969782550 and n
 assert kr_data.parse_krx_daily([]).empty
 # VKOSPI: 파생상품지수 표에서 '코스피 200 변동성지수'만 (그 선물지수 등은 아님), 쉼표 정리, 휴장일·실패는 NaN
 assert kr_data.is_vkospi("코스피 200 변동성지수") and kr_data.is_vkospi("코스피200 변동성지수")
-assert not kr_data.is_vkospi("코스피 200 변동성지수 선물지수") and not kr_data.is_vkospi("코스피 200 선물지수")
+assert not any(kr_data.is_vkospi(n) for n in ("코스피 200 변동성지수 선물지수", "코스피 200 선물지수", "코스피 200 가치저변동성",
+                                                 "코스피 200 변동성매칭 양매도지수", "코스피 200 변동성추세 추종 양매도지수"))
 _drv = {"20261023": pd.DataFrame([{"IDX_NM": "코스피 200 선물지수", "CLSPRC_IDX": "1,234.5"},
+                                  {"IDX_NM": "코스피 200 가치저변동성", "CLSPRC_IDX": "1,111"},
                                   {"IDX_NM": "코스피 200 변동성지수", "CLSPRC_IDX": "31.25"}]),
         "20261024": pd.DataFrame()}
 _drv0 = kr_data.krx_drv_index_day
