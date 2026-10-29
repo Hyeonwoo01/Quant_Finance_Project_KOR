@@ -481,7 +481,7 @@ LR_{\text{POF}} = -2\ln\frac{(1-p)^{n-x}p^{x}}{(1-\hat\pi)^{n-x}\hat\pi^{x}} \si
 지수는 FHS가 조금 나았지만(코스피 95% 예외 7.0% → 6.1%) 여전히 기각이고, 개별 종목은 750개 잔차로 정하는 99% 분위수가 흔들려 예외가 늘었습니다.
 코드: `GarchVolForecaster.tail`, `simulate(innov=)`, `var_backtest(innov=)`, `VAR_INNOV` (`quant_engine.py`), `var_tail_rule` (`validation.py`).
 
-### σ 보정: VKOSPI 섞기 · 크기 재보정
+### σ 보정: VKOSPI 섞기 · 장중 고가·저가 섞기 · 크기 재보정
 진단(`var_study.py`, [EXPERIMENTS.md](EXPERIMENTS.md))에서 지수의 문제는 꼬리 모양보다 σ의 크기였습니다.
 검증 구간에서 실제 분산이 예측보다 23~28% 컸고, 학습 구간 안의 표준화 잔차는 분산 1로 맞았습니다.
 그래서 같은 GARCH 예측 $`\sigma_t`$에 날짜별 배수 $`c_t`$를 곱하는 두 후보를 결과를 보기 전에 등록했습니다(꼬리 분포는 그대로, VaR·ES 모두 $`c_t`$배).
@@ -511,7 +511,23 @@ c_t = \mathrm{clip}\Big(\sqrt{\tfrac{1}{250}\textstyle\sum_{s=t-250}^{t-1} z_s^2
 몰림은 줄었지만(독립성 p 0.010 → 0.054) 분위수 손실이 나빠져 채택하지 않았습니다(`var_cluster_rule`).
 같은 방식으로 휴장 뒤 첫 거래일(월요일·연휴 다음 날)만 따로 맞추는 후보(`group_recal_factor`, `after_break`)도 시험했습니다.
 그날의 예외는 줄었지만(종목 평균 6.6% → 5.3%) 분위수 손실이 나아지지 않아(코스피 1.000, 종목 중앙값 1.011) 채택하지 않았습니다.
-코드: `var_rescale`, `recal_factor`, `iv_blend_factor` (`quant_engine.py`), `vkospi` (`kr_data.py`), `var_scale_rule` (`validation.py`).
+
+**장중 고가·저가 섞기(R1, 2026-10-29)**: 종가만 보는 GARCH는 그날 장중에 얼마나 크게 흔들렸는지 모릅니다.
+일봉의 시가 $`O`$·고가 $`H`$·저가 $`L`$·종가 $`C`$로 하루 실현 분산을 재고(밤사이 갭² + Rogers–Satchell), 지수가중 평균(RiskMetrics 0.94)을 섞습니다.
+
+```math
+RV_t = \big(\ln O_t - \ln C_{t-1}\big)^2 + \ln\tfrac{H_t}{C_t}\ln\tfrac{H_t}{O_t} + \ln\tfrac{L_t}{C_t}\ln\tfrac{L_t}{O_t}, \qquad
+\overline{RV}_t = 0.94\,\overline{RV}_{t-1} + 0.06\,RV_t, \qquad
+\tilde\sigma_{t+1}^2 = \tfrac12\,\sigma_{t+1}^2 + \tfrac12\,\overline{RV}_t
+```
+
+- $`\overline{RV}_t`$는 t일 장 마감에 알 수 있어 미래 정보가 없습니다. 고가 < max(시가, 종가)처럼 무효한 일봉은 건너뛰고 이전 값을 그대로 둡니다.
+- 사전 등록 규칙으로 판정했습니다. 코스피 지수·KODEX 200 밖의 33종목은 분위수 손실 비율 중앙값 0.983(앞 0.976·뒤 0.987)으로 31종목이 나아졌습니다.
+  VaR 검정 통과가 17 → 25, ES가 32 → 33, 99% 예외 몰림(독립성 기각)이 9 → 5종목이 되어 **채택**했습니다.
+- 코스피 지수·KODEX 200은 이미 VKOSPI를 섞은 σ가 다시 작아져(코스피 95% 예외 5.1% → 6.1%) 비율이 1.02~1.03으로 나빠져 **채택하지 않았습니다**.
+- 그래서 하루 VaR(앱·실전 기록·검증 보고서)는 코스피 지수·KODEX 200은 VKOSPI 섞기, 나머지 종목은 장중 고가·저가 섞기로 계산합니다.
+  최근 750거래일 중 유효한 일봉이 80% 미만이거나 일봉을 받지 못하면 GARCH만 씁니다.
+코드: `var_rescale`, `recal_factor`, `iv_blend_factor`, `range_variance`, `ewma_level`, `range_blend_factor`, `range_level_now`, `day1_var_factor` (`quant_engine.py`), `vkospi` (`kr_data.py`), `var_scale_rule`, `var_cluster_rule` (`validation.py`).
 
 ### ES 검정 (예외일 손실의 크기)
 예외 '횟수'가 맞아도 넘을 때 얼마나 크게 넘는지는 따로 봐야 합니다. 예측 ES는 분산이 1인 충격 분포의 꼬리 평균에 그날 변동성을 곱한 값입니다

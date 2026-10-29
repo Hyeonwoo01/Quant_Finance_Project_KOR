@@ -281,6 +281,9 @@ VAR_INNOV = "t"
 # 하루 VaR σ 보정 (EXPERIMENTS.md 2026-10-29 사전 등록 규칙으로 판정): 코스피 200을 따르는 종목은 GARCH 분산과 전날 종가의
 # VKOSPI 분산을 반반 섞는다 (iv_blend_factor). 모든 종목의 크기 재보정(recal_factor)은 규칙을 통과하지 못해 쓰지 않는다.
 VAR_IV_TICKERS = ("^KS11", "069500.KS")
+# 그 밖의 종목은 GARCH 분산과 장중 고가·저가로 잰 최근 실현 분산(range_variance의 지수가중 평균 0.94)을 반반 섞는다
+# (EXPERIMENTS.md 2026-10-29 사전 등록 R1, 코스피 200 두 종목에서는 나빠져 채택하지 않음). 유효한 일봉이 80% 미만이면 GARCH만.
+RANGE_LAMBDA, RANGE_MIN_VALID, RANGE_WINDOW = 0.94, 0.8, 750
 
 
 def fit_vol_model(returns, model="auto", dist="t"):
@@ -774,6 +777,24 @@ def range_blend_factor(sigma, rv_prev, weight=0.5):
     rv = np.where(rv > 0, rv, np.nan)
     f = np.sqrt(weight * s ** 2 + (1 - weight) * rv) / s
     return np.where(np.isfinite(f) & (f > 0), f, 1.0)
+
+
+def range_level_now(ohlc, index, min_valid=RANGE_MIN_VALID, window=RANGE_WINDOW, lam=RANGE_LAMBDA):
+    """index 마지막 날 장 마감 기준 장중 실현 분산의 지수가중 평균 (다음 날 하루 VaR에 섞는 값).
+    ohlc: 일봉(시가·고가·저가·종가), index: 쓰는 종가의 날짜 (끝나지 않은 오늘 봉은 이미 뺀 것).
+    최근 window일 중 유효한 일봉이 min_valid보다 적으면 NaN (→ GARCH만)."""
+    rv = range_variance(ohlc).reindex(pd.DatetimeIndex(index))
+    if rv.iloc[-window:].notna().mean() < min_valid:
+        return np.nan
+    return float(ewma_level(rv, lam).iloc[-1])
+
+
+def day1_var_factor(sigma_next, use_iv, vkospi=np.nan, range_level=np.nan):
+    """채택된 하루 VaR σ 보정 배수 (EXPERIMENTS.md 2026-10-29): use_iv(코스피 200 종목)면 VKOSPI 섞기,
+    아니면 장중 고가·저가 섞기. 필요한 값이 없으면 1 (GARCH 그대로)."""
+    if use_iv:
+        return float(iv_blend_factor([sigma_next], [vkospi])[0])
+    return float(range_blend_factor([sigma_next], [range_level])[0])
 
 
 def iv_blend_factor(sigma, iv_prev, weight=0.5, trading_days=252):
