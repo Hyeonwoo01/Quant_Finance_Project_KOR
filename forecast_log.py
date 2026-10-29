@@ -25,7 +25,8 @@ import kr_data
 import market_data as md
 import regime as rg
 import repro
-from quant_engine import VAR_INNOV, VAR_IV_TICKERS, fit_vol_model, iv_blend_factor, ols, overlap_tstat, var_es, var_exception_tests
+from quant_engine import (VAR_INNOV, VAR_IV_TICKERS, day1_var_factor, fit_vol_model, ols, overlap_tstat, range_level_now, var_es,
+                          var_exception_tests)
 
 LOG_DIR = Path(__file__).parent / "forecast_log"
 LOG_PATH = LOG_DIR / "log.csv"
@@ -36,7 +37,8 @@ GARCH_YEARS = 3           # 앱 기본 '학습 데이터' 설정과 같게
 SENTIMENT = {"pc_volume": "풋/콜 거래량 비율", "pc_oi": "풋/콜 미결제약정 비율", "skew": "옵션 스큐 (풋 90% − 콜 110% IV)",
              "eps_rev_30d": "올해 EPS 전망 30일 변화", "news_7d": "뉴스 감성 (최근 7일 평균)"}
 COLUMNS = ["asof", "ticker", "close", "h", "p_up", "p_base", "model", "vol_garch", "lo95", "lo68", "hi68", "hi95",
-           "var95_1d", "var99_1d", "garch_ok", "vol_model", "var_innov", "var_vkospi", "iv_atm", "iv_days", "vol_index", "p_high",
+           "var95_1d", "var99_1d", "garch_ok", "vol_model", "var_innov", "var_vkospi", "var_range_vol", "iv_atm", "iv_days", "vol_index",
+           "p_high",
            *SENTIMENT, "news_n", "data_fp", "version", "logged_at"]
 
 
@@ -118,12 +120,21 @@ def predict(ticker, h=H, have=frozenset()):
     g = fit_vol_model(np.log(c3).diff().dropna().values, "auto")        # 앱 기본 '자동 (AIC)'과 같게
     sims = g.simulate(h)
     q = spot * np.exp(np.quantile(sims[:, -1], [0.025, 0.16, 0.84, 0.975]))
-    # 하루 VaR: 코스피 200을 따르는 종목은 GARCH와 그날 VKOSPI를 반반 섞은 σ (EXPERIMENTS.md 2026-10-29 판정). 없으면 GARCH 그대로
-    vk = kr_data.vkospi_on(asof) if ticker in VAR_IV_TICKERS else np.nan
-    d1 = float(iv_blend_factor([np.sqrt(g.sigma2_next)], [vk])[0]) * sims[:, 0]
+    # 하루 VaR σ 보정 (EXPERIMENTS.md 2026-10-29 판정): 코스피 200을 따르는 종목은 GARCH와 그날 VKOSPI를, 나머지는 GARCH와
+    # 장중 고가·저가로 잰 최근 실현 분산을 반반 섞는다. 필요한 값이 없으면 GARCH 그대로
+    use_iv = ticker in VAR_IV_TICKERS
+    vk = kr_data.vkospi_on(asof) if use_iv else np.nan
+    rl = np.nan
+    if not use_iv:
+        try:
+            rl = range_level_now(md.load_ohlc(ticker, GARCH_YEARS), close.index)
+        except Exception:
+            rl = np.nan
+    d1 = day1_var_factor(np.sqrt(g.sigma2_next), use_iv, vk, rl) * sims[:, 0]
     row.update(vol_garch=g.forecast_vol(h), lo95=q[0], lo68=q[1], hi68=q[2], hi95=q[3],
                var95_1d=var_es(d1, 0.95)[0], var99_1d=var_es(d1, 0.99)[0], garch_ok=bool(g.converged),
-               vol_model=g.name, var_innov=VAR_INNOV, var_vkospi=vk)     # 하루 VaR의 꼬리 분포 (t / fhs), 섞은 VKOSPI (없으면 빈칸)
+               vol_model=g.name, var_innov=VAR_INNOV, var_vkospi=vk,      # 하루 VaR의 꼬리 분포 (t / fhs), 섞은 VKOSPI (없으면 빈칸)
+               var_range_vol=float(np.sqrt(rl * 252)) if np.isfinite(rl) else np.nan)   # 섞은 장중 실현 변동성 (연율)
 
     # 시장 기대 변동성: 지금 옵션의 ATM IV(약 1개월 만기)와, 있으면 변동성 지수(SPY → VIX 등)
     try:

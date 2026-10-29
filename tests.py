@@ -597,6 +597,17 @@ assert range_variance(_oh2).iloc[10:12].isna().all() and np.isfinite(range_varia
 _ew = ewma_level(pd.Series([np.nan] + [1.0] * 19 + [2.0, np.nan, 3.0]), lam=0.5, init=19)
 assert np.isnan(_ew.iloc[18]) and _ew.iloc[19] == 1.0 and _ew.iloc[20] == 1.5 and _ew.iloc[21] == 1.5 and _ew.iloc[22] == 2.25
 assert np.allclose(range_blend_factor([0.01, 0.01, 0.01, 0.01], [1e-4, 4e-4, np.nan, 0.0]), [1, np.sqrt(2.5), 1, 1])
+# 앱·실전 기록이 쓰는 지금 값: 마지막 날의 지수가중 평균. 최근 750일 중 유효한 일봉이 80% 미만이면 NaN (→ GARCH만)
+from quant_engine import day1_var_factor, range_level_now
+assert np.isclose(range_level_now(_ohlc, _ohlc.index), ewma_level(_rv).iloc[-1])
+assert np.isclose(range_level_now(_ohlc, _ohlc.index[:900]), ewma_level(_rv.iloc[:900]).iloc[-1])   # 쓰는 종가의 날짜까지만
+_oh3 = _ohlc.copy()
+_oh3.iloc[-300:, 1] = _oh3.iloc[-300:, 2]                                         # 최근 300일 고가 = 저가 → 유효 60%
+assert np.isnan(range_level_now(_oh3, _oh3.index)) and np.isfinite(range_level_now(_oh3, _oh3.index, min_valid=0.5))
+# 하루 VaR 배수: 코스피 200 종목은 VKOSPI, 나머지는 장중 실현 분산. 다른 쪽 값은 쓰지 않음
+assert np.isclose(day1_var_factor(0.01, True, 100 * 0.02 * np.sqrt(252), 1e-4), np.sqrt(2.5))
+assert np.isclose(day1_var_factor(0.01, False, 100 * 0.02 * np.sqrt(252), 4e-4), np.sqrt(2.5))
+assert day1_var_factor(0.01, True, np.nan, 4e-4) == 1.0 and day1_var_factor(0.01, False, 40.0, np.nan) == 1.0
 # VKOSPI 섞기: σ² = ½ GARCH + ½ (IV/100)²/252. IV가 GARCH와 같으면 1, 두 배면 √2.5, 없거나 0이면 1
 _ivd = 100 * 0.01 * np.sqrt(252)
 assert np.allclose(iv_blend_factor(np.full(4, 0.01), np.array([np.nan, 0.0, _ivd, 2 * _ivd])), [1, 1, 1, np.sqrt(2.5)])
@@ -852,7 +863,7 @@ _full = pd.Series(100 * np.exp(np.cumsum(0.0003 + 0.011 * np.random.default_rng(
                   index=pd.bdate_range("2022-01-03", periods=1150))
 _cut = {"n": 1100}
 _orig = {k: getattr(md, k) for k in ("load_history", "load_macro", "risk_free_rate", "dividend_yield", "atm_implied_vol",
-                                     "load_vol_index")}
+                                     "load_vol_index", "load_ohlc")}
 _orig_alt = {k: getattr(ad, k) for k in ("build_alt_features", "options_snapshot", "estimate_revisions", "news_sentiment")}
 md.load_history = lambda t, years: _full.iloc[:_cut["n"]]
 md.load_macro = lambda t, years=10: None
@@ -860,6 +871,11 @@ md.risk_free_rate = lambda t="", default=0.04: (0.04, "테스트")
 md.dividend_yield = lambda t, s: 0.0
 md.atm_implied_vol = lambda t, s, d, r, q: {"iv": 0.19, "cal_days": 30}
 md.load_vol_index = lambda t, y: None
+_frg = np.random.default_rng(3)                                       # 종가에 맞춘 일봉 (장중 범위가 넓은 편)
+_fopen = _full.shift(1).bfill() * np.exp(0.004 * _frg.standard_normal(len(_full)))
+_fohlc = pd.DataFrame({"Open": _fopen, "High": np.maximum(_fopen, _full) * (1 + 0.012 * np.abs(_frg.standard_normal(len(_full)))),
+                       "Low": np.minimum(_fopen, _full) * (1 - 0.012 * np.abs(_frg.standard_normal(len(_full)))), "Close": _full})
+md.load_ohlc = lambda t, years: _fohlc                                # 미래 날짜 일봉이 있어도 쓰는 종가의 날짜까지만 씀
 ad.build_alt_features = lambda t, idx: (None, {})
 ad.options_snapshot = lambda t, s, r=0.04, q=0.0: {"pc_volume": 1.2, "pc_oi": 1.5, "skew": 0.05}
 ad.estimate_revisions = lambda t: pd.DataFrame({"30일 전 대비": [0.02, 0.01]}, index=["이번 분기", "올해"])
@@ -879,7 +895,17 @@ try:
     assert _row["lo95"] < _row["lo68"] < _row["close"] < _row["hi68"] < _row["hi95"] and 0 < _row["var95_1d"] < _row["var99_1d"]
     # 코스피 200 종목의 하루 VaR: GARCH와 그날 VKOSPI를 반반 섞은 σ → 하루 로그수익률 분위수가 같은 배수로 커짐 (21일 범위는 그대로)
     _base = fl.predict("SPY")
-    assert np.isnan(_base["var_vkospi"])                              # 대상 종목이 아니면 섞지 않음
+    assert np.isnan(_base["var_vkospi"])                              # 대상 종목이 아니면 VKOSPI는 섞지 않음
+    # 그 밖의 종목: 장중 고가·저가 실현 분산을 반반 섞음 (일봉을 못 받으면 GARCH 그대로) → 하루 분위수만 같은 배수로 바뀜
+    _rl = range_level_now(_fohlc, _full.index[:1100])
+    assert np.isclose(_base["var_range_vol"], np.sqrt(_rl * 252))
+    md.load_ohlc = lambda t, years: 1 / 0
+    try:
+        _g0 = fl.predict("SPY")
+    finally:
+        md.load_ohlc = lambda t, years: _fohlc
+    _f95, _f99 = (np.log1p(-_base[k]) / np.log1p(-_g0[k]) for k in ("var95_1d", "var99_1d"))
+    assert np.isnan(_g0["var_range_vol"]) and _f95 > 1.05 and np.isclose(_f95, _f99, rtol=1e-6) and np.isclose(_base["lo68"], _g0["lo68"])
     _ivt0, _vko0 = fl.VAR_IV_TICKERS, kr_data.vkospi_on
     fl.VAR_IV_TICKERS, kr_data.vkospi_on = ("SPY",), lambda d: 40.0
     try:
@@ -888,7 +914,7 @@ try:
         fl.VAR_IV_TICKERS, kr_data.vkospi_on = _ivt0, _vko0
     # 로그수익률 분위수가 같은 배수 (VaR는 단순 수익률이라 분위수 보간 때문에 1e-8 정도 어긋남)
     _c95, _c99 = (np.log1p(-_bl[k]) / np.log1p(-_base[k]) for k in ("var95_1d", "var99_1d"))
-    assert _bl["var_vkospi"] == 40.0 and _c95 > 1 and np.isclose(_c95, _c99, rtol=1e-6) and np.isclose(_bl["lo68"], _base["lo68"])
+    assert _bl["var_vkospi"] == 40.0 and np.isnan(_bl["var_range_vol"]) and _c95 > 1 and np.isclose(_c95, _c99, rtol=1e-6) and np.isclose(_bl["lo68"], _base["lo68"])
     # 시장 심리 지표도 앱과 같은 값으로 저장 (뉴스는 가장 최근 헤드라인 기준 7일: 1/20 하나만)
     assert _row["pc_oi"] == 1.5 and _row["eps_rev_30d"] == 0.01 and _row["news_7d"] == 0.25 and _row["news_n"] == 1
 finally:
@@ -1238,7 +1264,8 @@ try:
     assert _vr["[m1] VaR 검정"] in ("통과", "기각") and all(np.isfinite(_vr[f"분위수 손실 비율 (m1 ÷ 현재){_p}"]) for _p in ("", " 앞 절반", " 뒤 절반"))
     assert 0 <= _vr["[cur] 휴장 뒤 95% 예외"] <= 1 and 0 <= _vr["[m1] 휴장 뒤 95% 예외"] <= 1
     assert _vr["[r1] 유효한 날 비율"] == 1.0 and _vr["[r1] VaR 검정"] in ("통과", "기각")
-    assert all(np.isfinite(_vr[f"분위수 손실 비율 (r1 ÷ 현재){_p}"]) for _p in ("", " 앞 절반", " 뒤 절반"))
+    assert all(np.isfinite(_vr[f"분위수 손실 비율 (r1 ÷ 이전 기본){_p}"]) for _p in ("", " 앞 절반", " 뒤 절반"))
+    assert _vr["[pre] VaR 검정"] == _vr["VaR 검정"]                 # 코스피 200 종목은 R1을 쓰지 않음 → 본 표 = R1 이전(VKOSPI 섞기)
     # 사전 등록 규칙: 분위수 손실 비율 중앙값 < 1 이고 VaR·ES 통과 수가 줄지 않을 때만 FHS
     _mk = lambda ratio, vt_, vf, et, ef: {"[t] VaR 검정": vt_, "[fhs] VaR 검정": vf, "[t] ES 검정": et, "[fhs] ES 검정": ef,
                                           "분위수 손실 비율 (FHS ÷ t)": ratio}
@@ -1316,8 +1343,10 @@ try:
         assert "## 하루 VaR 예외 몰림" in _md and ("나머지 1종목" in _md) and "## 하루 VaR 휴장 뒤 첫 거래일" in _md
         assert "## 하루 VaR 장중 고가·저가 변동성 섞기(R1)" in _md
         assert "## 최근 1년(이례적 급등락 구간)을 뺀 결과" in _md
-        assert _rows[0]["VaR σ 보정"] == "없음" and _rows[0]["VaR 검정"] == _rows[0]["[t] VaR 검정"]   # 대상이 아니면 본 표 = 기본(t)
-        assert _rows[0]["VaR 95% 예외 비율"] == _rows[0]["[t] VaR 95% 예외"]
+        # 코스피 200 종목이 아니면 본 표 = 장중 고가·저가 섞기(R1), R1 비교 기준은 기본(t), K2·M1 비교 기준은 R1
+        assert _rows[0]["VaR σ 보정"] == "장중 고가·저가 섞기" and _rows[0]["VaR 검정"] == _rows[0]["[r1] VaR 검정"]
+        assert _rows[0]["VaR 95% 예외 비율"] == _rows[0]["[r1] VaR 95% 예외"] and _rows[0]["[pre] VaR 검정"] == _rows[0]["[t] VaR 검정"]
+        assert _rows[0]["[cur] VaR 검정"] == _rows[0]["[r1] VaR 검정"] and "†" in _md
         _sv = pd.read_csv(Path(_vd) / "summary.csv")
         assert len(_sv) == 2 and pd.isna(_sv.loc[0, "오류"]) and "주가 데이터 없음" in _sv.loc[1, "오류"]
     # 유효한 일봉이 80% 미만이면 R1은 비교하지 않고 비율만 남김 (규칙의 '비교 못 한 종목')
@@ -1326,6 +1355,7 @@ try:
     md.load_ohlc = lambda t, years: _bad
     _vb = vd.validate("005930.KS")
     assert _vb["[r1] 유효한 날 비율"] < vd.R1_MIN_VALID and "[r1] VaR 검정" not in _vb
+    assert _vb["VaR σ 보정"] == "없음" and _vb["VaR 검정"] == _vb["[t] VaR 검정"]      # 비교 못 하면 GARCH만
     assert vd.var_cluster_rule([_vr, _vb], "r1")["비교 못 한 종목"] == ["005930.KS"]
 finally:
     for _k, _v in _orig_v.items():

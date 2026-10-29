@@ -25,8 +25,9 @@ from scipy import stats
 import forecast_log as fl
 import kr_data
 import market_data as md
-from quant_engine import VAR_IV_TICKERS, fit_vol_model, iv_blend_factor, var_backtest, var_exception_tests, var_rescale
-from validation import VAR_START, _vkospi_prev
+from quant_engine import (VAR_IV_TICKERS, ewma_level, fit_vol_model, iv_blend_factor, range_blend_factor, range_variance, var_backtest,
+                          var_exception_tests, var_rescale)
+from validation import R1_MIN_VALID, VAR_START, _vkospi_prev
 
 # 지수·지수 ETF와, 비교용으로 VaR 검정을 통과·기각한 개별 종목 몇 개
 TICKERS = ["^KS11", "069500.KS", "229200.KS", "005930.KS", "000660.KS", "035420.KS", "모의 (모델이 맞는 경우)"]
@@ -131,8 +132,8 @@ CLUSTER_TICKERS = ["^KS11", "069500.KS", "229200.KS", "005930.KS", "000660.KS", 
 
 
 def current_var(ticker, r):
-    """지금 기본 하루 VaR의 검증 구간 날짜별 표 (자동 GARCH·t분포, 코스피 200 종목은 전날 VKOSPI 섞기 — validation.py와 같게).
-    반환: (날짜별 표, 전날 VKOSPI 또는 None)."""
+    """지금 기본 하루 VaR의 검증 구간 날짜별 표 (자동 GARCH·t분포, 코스피 200 종목은 전날 VKOSPI 섞기, 나머지는 장중 고가·저가
+    섞기 — validation.py와 같게). 반환: (날짜별 표, 전날 VKOSPI 또는 None)."""
     rr = r.values
     start = max(min(VAR_START, len(rr) - 500), 250)
     tab, d = var_backtest(rr, model="auto", start=start, detail=True, innov="t")
@@ -141,6 +142,13 @@ def current_var(ticker, r):
         iv = _vkospi_prev(r.index[start:])
         if iv is not None:
             tab, d = var_rescale(tab, d, iv_blend_factor(d["변동성"], iv))
+    else:
+        try:
+            rv = range_variance(md.load_ohlc(ticker, 10)).reindex(r.index)
+            if rv.iloc[start:].notna().mean() >= R1_MIN_VALID:
+                tab, d = var_rescale(tab, d, range_blend_factor(d["변동성"], ewma_level(rv).shift(1).iloc[start:].to_numpy()))
+        except Exception:
+            pass
     d.index = r.index[start:]
     return d, iv
 
