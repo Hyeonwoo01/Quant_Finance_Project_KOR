@@ -4,6 +4,12 @@ name: var-study
 # 저장·커밋 없음. 진단 코드가 바뀐 푸시(main 제외)와 수동 실행에서 돈다.
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "sigma = σ 크기 진단 (2026-10-29 첫 진단), cluster = 예외 몰림 진단"
+        type: choice
+        options: [cluster, sigma]
+        default: cluster
   push:
     branches-ignore: [main]
     paths:
@@ -40,7 +46,7 @@ jobs:
       - name: 진단
         env:
           KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
-        run: python var_study.py
+        run: python var_study.py ${{ inputs.mode || 'cluster' }}
       - name: 받은 데이터 저장
         if: always()
         uses: actions/cache/save@v4
