@@ -10,8 +10,14 @@
 VKOSPI(KRX 파생상품지수)는 검증 기간에 받을 수 있는지만 확인한다.
 후보 수정은 이 진단을 본 뒤, 그 성적을 보기 전에 EXPERIMENTS.md에 사전 등록한다.
 
-실제 시세는 GitHub Actions(var-study.yml)에서 받는다: python var_study.py
+두 번째 진단(cluster, 2026-10-29): VKOSPI 섞기를 채택한 뒤에도 코스피 지수 VaR 검정이 기각되는 이유 — 예외가 몰려 나오는가.
+지금 기본(코스피 200 종목은 VKOSPI 섞기)의 예외를 쪼개 본다: 수준별 Kupiec·Christoffersen와 전이 확률, 몰린 구간,
+전날 표준화 수익률·요일·전날 VKOSPI 변화별 예외, 예외 다음 날 σ가 얼마나 따라 올랐는지. 후보의 성적은 계산하지 않는다.
+
+실제 시세는 GitHub Actions(var-study.yml)에서 받는다: python var_study.py [sigma | cluster]
 """
+import sys
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -19,8 +25,8 @@ from scipy import stats
 import forecast_log as fl
 import kr_data
 import market_data as md
-from quant_engine import fit_vol_model, var_backtest
-from validation import VAR_START
+from quant_engine import VAR_IV_TICKERS, fit_vol_model, iv_blend_factor, var_backtest, var_exception_tests, var_rescale
+from validation import VAR_START, _vkospi_prev
 
 # 지수·지수 ETF와, 비교용으로 VaR 검정을 통과·기각한 개별 종목 몇 개
 TICKERS = ["^KS11", "069500.KS", "229200.KS", "005930.KS", "000660.KS", "035420.KS", "모의 (모델이 맞는 경우)"]
@@ -121,6 +127,92 @@ def _fmt(v):
     return str(v)
 
 
+CLUSTER_TICKERS = ["^KS11", "069500.KS", "229200.KS", "005930.KS", "000660.KS", SIM]
+
+
+def current_var(ticker, r):
+    """지금 기본 하루 VaR의 검증 구간 날짜별 표 (자동 GARCH·t분포, 코스피 200 종목은 전날 VKOSPI 섞기 — validation.py와 같게).
+    반환: (날짜별 표, 전날 VKOSPI 또는 None)."""
+    rr = r.values
+    start = max(min(VAR_START, len(rr) - 500), 250)
+    tab, d = var_backtest(rr, model="auto", start=start, detail=True, innov="t")
+    iv = None
+    if ticker in VAR_IV_TICKERS:
+        iv = _vkospi_prev(r.index[start:])
+        if iv is not None:
+            tab, d = var_rescale(tab, d, iv_blend_factor(d["변동성"], iv))
+    d.index = r.index[start:]
+    return d, iv
+
+
+def cluster_report(d, iv=None, gap=3):
+    """예외 몰림 진단. gap: 예외 사이가 이 거래일 수 이하면 같은 묶음."""
+    out = {}
+    x, s = d["수익률"], d["변동성"]
+    z = x / s
+    for lv in (0.95, 0.99):
+        h = d[f"예외 {lv:.0%}"].astype(bool).to_numpy()
+        a, b = h[:-1], h[1:]
+        n01, n11 = int(np.sum(~a & b)), int(np.sum(a & b))
+        out[f"검정 {lv:.0%}"] = {**var_exception_tests(h, 1 - lv),
+                               "π01 (전날 예외 아님 → 예외)": n01 / max(int(np.sum(~a)), 1),
+                               "π11 (전날 예외 → 예외)": n11 / max(int(np.sum(a)), 1), "이틀 연속 예외": n11}
+    h = d["예외 95%"].astype(bool)
+    pos = np.flatnonzero(h.to_numpy())
+    groups = np.split(pos, np.flatnonzero(np.diff(pos) > gap) + 1) if len(pos) else []
+    out["몰린 구간 (95%, 예외 사이 3거래일 이하, 2번 이상)"] = pd.DataFrame(
+        [{"시작": d.index[g[0]].date(), "끝": d.index[g[-1]].date(), "예외 수": len(g),
+          "손실 ÷ VaR 평균": float((-x.iloc[g] / d["VaR 95%"].iloc[g]).mean()),
+          "구간 첫날 예측 변동성(연)": float(s.iloc[g[0]] * np.sqrt(252))} for g in groups if len(g) >= 2])
+    zp = z.shift(1)
+    lab = pd.cut(zp, [-np.inf, -2, -1, 1, 2, np.inf], labels=["< −2", "−2 ~ −1", "−1 ~ 1", "1 ~ 2", "> 2"])
+    out["전날 z별"] = pd.DataFrame({"일수": d.groupby(lab, observed=False).size(),
+                                 "95% 예외": d["예외 95%"].groupby(lab, observed=False).mean(),
+                                 "99% 예외": d["예외 99%"].groupby(lab, observed=False).mean(),
+                                 "그날 z 표준편차": z.groupby(lab, observed=False).std()})
+    wd = pd.Series(d.index.dayofweek, index=d.index).map(dict(enumerate("월화수목금토일")))
+    out["요일별"] = pd.DataFrame({"일수": d.groupby(wd).size(), "95% 예외": d["예외 95%"].groupby(wd).mean(),
+                               "z 표준편차": z.groupby(wd).std()}).reindex(list("월화수목금"))
+    after = h.shift(1, fill_value=False)
+    out["예외 다음 날"] = {"예외 다음 날 수": int(after.sum()),
+                        "예측 σ 오른 배수 (중앙값)": float((s / s.shift(1))[after].median()),
+                        "z 표준편차 (예외 다음 날)": float(z[after].std()), "z 표준편차 (그 밖)": float(z[~after].std()),
+                        "95% 예외 비율 (예외 다음 날)": float(h[after].mean()),
+                        "예외 다음 날 손실 쪽 / 이익 쪽 큰 움직임(|z|>2)": f"{int(((z < -2) & after).sum())} / {int(((z > 2) & after).sum())}"}
+    if iv is not None:
+        ivs = pd.Series(iv, index=d.index)
+        dv = np.log(ivs).diff()                                   # 전날 VKOSPI의 하루 변화 (그날 아침에 이미 앎)
+        ok = dv.notna()
+        lv3 = _tercile(dv[ok], ["VKOSPI 내림", "비슷", "VKOSPI 오름"])
+        out["전날 VKOSPI 변화별"] = pd.DataFrame({"일수": d[ok].groupby(lv3, observed=False).size(),
+                                           "95% 예외": d.loc[ok, "예외 95%"].groupby(lv3, observed=False).mean(),
+                                           "z 표준편차": z[ok].groupby(lv3, observed=False).std()})
+    return out
+
+
+def main_cluster():
+    pd.set_option("display.width", 200)
+    for t in CLUSTER_TICKERS:
+        print(f"\n==================== {t} ====================", flush=True)
+        try:
+            r = log_returns(t)
+            d, iv = current_var(t, r)
+            out = cluster_report(d, iv)
+        except Exception as e:
+            print(f"실패: {type(e).__name__}: {str(e)[:200]}", flush=True)
+            continue
+        print(f"검증 기간: {d.index[0].date()} ~ {d.index[-1].date()} · {len(d)}일 · "
+              f"{'VKOSPI 섞기' if iv is not None else '기본 (GARCH만)'}")
+        for k, v in out.items():
+            print(f"\n[{k}]")
+            if isinstance(v, pd.DataFrame):
+                print(v.to_string(float_format=lambda u: f"{u:.4f}") if len(v) else "  없음")
+            else:
+                for kk, vv in v.items():
+                    print(f"  {kk}: {_fmt(vv)}")
+        print(flush=True)
+
+
 def main():
     pd.set_option("display.width", 200)
     idx = None
@@ -167,4 +259,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main_cluster() if (sys.argv[1:] or ["sigma"])[0] == "cluster" else main()

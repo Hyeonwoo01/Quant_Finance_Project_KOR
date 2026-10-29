@@ -704,6 +704,23 @@ def recal_factor(returns, sigma, window=250, min_obs=125, clip=(0.8, 1.5)):
     return c.clip(*clip).fillna(1.0).to_numpy()
 
 
+def cond_recal_factor(returns, sigma, threshold=1.0, min_obs=30, clip=(0.8, 1.5)):
+    """전날 움직임별 σ 재보정 배수: 전날 표준화 수익률 z_{t−1} = r/σ를 세 구간(< −threshold, 사이, > threshold)으로 나누고,
+    그날 전까지 같은 구간이었던 날들의 z² 평균의 제곱근을 곱한다 (그날은 넣지 않음 → 미래 정보 없음).
+    큰 하락 다음 날 실제 움직임이 예측보다 꾸준히 크면 그만큼 키운다. 그 구간의 지난 날이 min_obs보다 적으면 1, clip으로 자른다."""
+    z = np.asarray(returns, float) / np.asarray(sigma, float)
+    prev = np.r_[np.nan, z[:-1]]
+    bucket = np.where(prev < -threshold, 0, np.where(prev > threshold, 2, 1))
+    total, count, out = np.zeros(3), np.zeros(3), np.ones(len(z))
+    for t, k in enumerate(bucket):
+        if count[k] >= min_obs:
+            out[t] = min(max(np.sqrt(total[k] / count[k]), clip[0]), clip[1])
+        if np.isfinite(z[t]):
+            total[k] += z[t] ** 2
+            count[k] += 1
+    return out
+
+
 def iv_blend_factor(sigma, iv_prev, weight=0.5, trading_days=252):
     """내재변동성 섞기 배수: σ_섞음² = weight·σ_GARCH² + (1−weight)·(IV/100)²/trading_days, 배수 = σ_섞음 ÷ σ_GARCH.
     iv_prev: 예측하는 날 전날 종가의 변동성 지수(연율 %, 예: VKOSPI). 값이 없는 날은 1 (GARCH 그대로)."""

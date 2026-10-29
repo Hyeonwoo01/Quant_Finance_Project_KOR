@@ -554,6 +554,18 @@ _rx2[300:] *= 0.1
 _rc2 = recal_factor(_rx2, _rs, window=100, min_obs=50)
 assert np.array_equal(_rc2[:301], _rc[:301]) and _rc2[-1] < _rc[-1]
 assert (np.abs(recal_factor(_rx * 0.5, _rs, 100, 50)[100:] - 1) < 0.2).all()   # σ가 맞으면 1 근처
+# 전날 움직임별 재보정(K2): 전날 z 구간(< −1, 사이, > 1)마다 그날 전까지 같은 구간이던 날들의 z² 평균의 제곱근 (0.8~1.5)
+from quant_engine import cond_recal_factor
+_kr2 = np.tile([-3.0, 2.0, 0.5, 0.5], 60)                    # σ = 1: 큰 하락 다음 날은 늘 z = 2, 큰 상승 다음 날은 z = 0.5
+_kc = cond_recal_factor(_kr2, np.ones_like(_kr2), min_obs=3)
+_after_dn, _after_up = np.arange(1, 240, 4), np.arange(2, 240, 4)
+assert (_kc[_after_dn[:3]] == 1).all() and (_kc[_after_dn[3:]] == 1.5).all()      # 하락 다음 날: √4 = 2 → 상한 1.5
+assert (_kc[_after_up[:3]] == 1).all() and (_kc[_after_up[3:]] == 0.8).all()      # 상승 다음 날: √0.25 = 0.5 → 하한 0.8
+_mid = np.setdiff1d(np.arange(240), np.r_[_after_dn, _after_up])
+assert np.isclose(_kc[_mid[-1]], min(1.5, np.sqrt(np.mean(_kr2[_mid[:-1]] ** 2))))
+_kr3 = _kr2.copy()
+_kr3[150:] *= 3
+assert np.array_equal(cond_recal_factor(_kr3, np.ones_like(_kr3), min_obs=3)[:151], _kc[:151])   # 그날 이후 값은 영향 없음
 # VKOSPI 섞기: σ² = ½ GARCH + ½ (IV/100)²/252. IV가 GARCH와 같으면 1, 두 배면 √2.5, 없거나 0이면 1
 _ivd = 100 * 0.01 * np.sqrt(252)
 assert np.allclose(iv_blend_factor(np.full(4, 0.01), np.array([np.nan, 0.0, _ivd, 2 * _ivd])), [1, 1, 1, np.sqrt(2.5)])
@@ -1183,6 +1195,10 @@ try:
     # VKOSPI 섞기 대상 종목은 본 표가 섞은 VaR (2026-10-29 판정), 아니면 기본(t) 그대로
     assert _vr["VaR σ 보정"] == "VKOSPI 섞기" and _vr["VaR 검정"] == _vr["[vkospi] VaR 검정"]
     assert _vr["VaR 95% 예외 비율"] == _vr["[vkospi] VaR 95% 예외"] and _vr["VaR 99% 예외 비율"] == _vr["[vkospi] VaR 99% 예외"]
+    # 예외 몰림 후보 K2는 지금 기본(이 종목은 VKOSPI 섞기)과 비교
+    assert _vr["[cur] VaR 검정"] == _vr["VaR 검정"] and _vr["[k2] VaR 검정"] in ("통과", "기각")
+    assert all(np.isfinite(_vr[f"분위수 손실 비율 (k2 ÷ 현재){_p}"]) for _p in ("", " 앞 절반", " 뒤 절반"))
+    assert 0 <= _vr["[k2] 99% 독립성 p"] <= 1 and 0 <= _vr["[cur] 95% 독립성 p"] <= 1
     # 사전 등록 규칙: 분위수 손실 비율 중앙값 < 1 이고 VaR·ES 통과 수가 줄지 않을 때만 FHS
     _mk = lambda ratio, vt_, vf, et, ef: {"[t] VaR 검정": vt_, "[fhs] VaR 검정": vf, "[t] ES 검정": et, "[fhs] ES 검정": ef,
                                           "분위수 손실 비율 (FHS ÷ t)": ratio}
@@ -1211,6 +1227,19 @@ try:
     _o3 = vd.var_scale_rule([_ms("^KS11", _bd, c1=_gd), _ms("069500.KS", _bd, c1=_gd)])
     assert not _o3["C2 채택"] and _o3["C1 채택"] and _o3["다른 종목에 쓸 것"] == "기본 그대로"
     assert not vd.var_scale_rule([_ms("^KS11", _gd, c1=_gd)])["C1 채택"]          # 두 종목 모두 있어야
+    # 예외 몰림 K2 규칙: 코스피 200 두 종목과 나머지를 따로. 세 구간 모두 < 1, VaR·ES 통과 수 유지
+    def _mk2(t, k2, vc="통과", vk="통과", ec="통과", ek="통과"):
+        r = {"종목": t, "[cur] VaR 검정": vc, "[k2] VaR 검정": vk, "[cur] ES 검정": ec, "[k2] ES 검정": ek,
+             "[cur] 99% 독립성 p": 0.01, "[k2] 99% 독립성 p": 0.2}
+        r.update({f"분위수 손실 비율 (k2 ÷ 현재){p}": x for p, x in zip(("", " 앞 절반", " 뒤 절반"), k2)})
+        return r
+    _q = vd.var_cluster_rule([_mk2("^KS11", _gd, vc="기각"), _mk2("069500.KS", _gd), _mk2("005930.KS", _bd), _mk2("000660.KS", _bd)])
+    assert _q["코스피 200 K2 채택"] and not _q["나머지 K2 채택"] and _q["코스피 200 VaR 검정 통과 현재 → K2"] == (1, 2)
+    assert not vd.var_cluster_rule([_mk2("^KS11", _gd), _mk2("069500.KS", _bd)])["코스피 200 K2 채택"]
+    assert not vd.var_cluster_rule([_mk2("^KS11", _gd, ek="기각"), _mk2("069500.KS", _gd)])["코스피 200 K2 채택"]
+    _q2 = vd.var_cluster_rule([_mk2("005930.KS", _gd), _mk2("000660.KS", _gd), _mk2("035420.KS", _bd)])
+    assert _q2["나머지 K2 채택"] and not _q2["코스피 200 K2 채택"] and _q2["나머지 K2가 나은 종목"] == 3
+    assert not vd.var_cluster_rule([_mk2("005930.KS", _gd, vk="기각"), _mk2("000660.KS", _gd)])["나머지 K2 채택"]
     # 전날 VKOSPI: 수익률 날짜마다 그 전 거래일 값 (첫날은 없음)
     _gk0, _vk0 = kr_data.get_key, kr_data.vkospi
     kr_data.get_key = lambda n: "x"
@@ -1238,6 +1267,7 @@ try:
         assert "## 21일 분할 보유 전략" in _md and "## 예측 확률 구간별 실제 21일 수익" in _md and "## 하루 VaR·ES 검정" in _md
         assert "## 하루 VaR 꼬리 분포 비교" in _md and "판정:" in _md and "앞 절반" in _md
         assert "## 하루 VaR σ 보정" in _md and ("**C2 채택**" in _md or "**C2 미채택**" in _md)
+        assert "## 하루 VaR 예외 몰림" in _md and ("나머지 1종목" in _md)
         assert "## 최근 1년(이례적 급등락 구간)을 뺀 결과" in _md
         assert _rows[0]["VaR σ 보정"] == "없음" and _rows[0]["VaR 검정"] == _rows[0]["[t] VaR 검정"]   # 대상이 아니면 본 표 = 기본(t)
         assert _rows[0]["VaR 95% 예외 비율"] == _rows[0]["[t] VaR 95% 예외"]
