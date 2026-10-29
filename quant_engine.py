@@ -656,20 +656,59 @@ def var_backtest(returns, levels=(0.95, 0.99), window=750, refit_every=21, start
     x, sig = r[start:], np.array(sig)
     out = {}
     for m in innovs:
-        rows, daily = {}, {"수익률": x, "변동성": sig}
-        for lv in levels:
-            v, e = np.array(V[(m, lv)]), np.array(E[(m, lv)])
-            hit = x < -v
-            row = var_exception_tests(hit, 1 - lv)
-            row["예외일 손실 ÷ 예측 ES"], row["ES 검정 p값"] = es_exceedance_test(-x[hit], e[hit], sig[hit])
-            tau = 1 - lv
-            row["분위수 손실(×10⁴)"] = float(np.mean((x + v) * (tau - (x < -v))) * 1e4)
-            row["재적합 수"], row["추정 실패"] = n_fit, n_fail
-            rows[f"하루 VaR {lv:.0%}"] = row
-            daily.update({f"VaR {lv:.0%}": v, f"ES {lv:.0%}": e, f"예외 {lv:.0%}": hit})
-        table = pd.DataFrame(rows).T
-        out[m] = (table, pd.DataFrame(daily)) if detail else table
+        table, daily = _var_score(x, sig, {lv: np.array(V[(m, lv)]) for lv in levels},
+                                  {lv: np.array(E[(m, lv)]) for lv in levels}, n_fit, n_fail)
+        out[m] = (table, daily) if detail else table
     return out[innov] if isinstance(innov, str) else out
+
+
+def _var_score(x, sig, V, E, n_fit, n_fail):
+    """수준별 VaR·ES(양수 = 손실률) → (표, 날짜별 표). var_backtest와 var_rescale이 같은 채점을 쓴다."""
+    rows, daily = {}, {"수익률": x, "변동성": sig}
+    for lv in V:
+        v, e = V[lv], E[lv]
+        hit = x < -v
+        row = var_exception_tests(hit, 1 - lv)
+        row["예외일 손실 ÷ 예측 ES"], row["ES 검정 p값"] = es_exceedance_test(-x[hit], e[hit], sig[hit])
+        tau = 1 - lv
+        row["분위수 손실(×10⁴)"] = float(np.mean((x + v) * (tau - (x < -v))) * 1e4)
+        row["재적합 수"], row["추정 실패"] = n_fit, n_fail
+        rows[f"하루 VaR {lv:.0%}"] = row
+        daily.update({f"VaR {lv:.0%}": v, f"ES {lv:.0%}": e, f"예외 {lv:.0%}": hit})
+    return pd.DataFrame(rows).T, pd.DataFrame(daily)
+
+
+def var_rescale(table, daily, factor):
+    """같은 GARCH 예측의 σ에 날짜별 배수 factor를 곱해 다시 채점 (꼬리 분포는 그대로 → VaR·ES·σ가 모두 같은 배수).
+    table, daily: var_backtest(detail=True)의 표와 날짜별 표. factor: 날짜별 배수 (NaN·0 이하는 1 = 그대로).
+    반환: var_backtest와 같은 (표, 날짜별 표)."""
+    c = np.asarray(factor, float)
+    c = np.where(np.isfinite(c) & (c > 0), c, 1.0)
+    lv_cols = [k for k in daily.columns if k.startswith("VaR ")]
+    levels = [float(k.split()[1].rstrip("%")) / 100 for k in lv_cols]
+    V = {lv: daily[f"VaR {lv:.0%}"].to_numpy() * c for lv in levels}
+    E = {lv: daily[f"ES {lv:.0%}"].to_numpy() * c for lv in levels}
+    first = table.iloc[0]
+    return _var_score(daily["수익률"].to_numpy(), daily["변동성"].to_numpy() * c, V, E,
+                      int(first["재적합 수"]), int(first["추정 실패"]))
+
+
+def recal_factor(returns, sigma, window=250, min_obs=125, clip=(0.8, 1.5)):
+    """σ 크기 재보정 배수: 지난 window일(그날 제외) 표준화 수익률 z = r/σ의 제곱 평균의 제곱근.
+    예측 σ가 실제보다 꾸준히 작으면(z² 평균 > 1) 그만큼 키운다. 지난 날이 min_obs보다 적으면 1, clip 범위로 자른다."""
+    z2 = pd.Series((np.asarray(returns, float) / np.asarray(sigma, float)) ** 2)
+    c = np.sqrt(z2.rolling(window, min_periods=min_obs).mean().shift(1))
+    return c.clip(*clip).fillna(1.0).to_numpy()
+
+
+def iv_blend_factor(sigma, iv_prev, weight=0.5, trading_days=252):
+    """내재변동성 섞기 배수: σ_섞음² = weight·σ_GARCH² + (1−weight)·(IV/100)²/trading_days, 배수 = σ_섞음 ÷ σ_GARCH.
+    iv_prev: 예측하는 날 전날 종가의 변동성 지수(연율 %, 예: VKOSPI). 값이 없는 날은 1 (GARCH 그대로)."""
+    s = np.asarray(sigma, float)
+    iv = np.asarray(iv_prev, float) / 100.0
+    iv = np.where(iv > 0, iv, np.nan)
+    f = np.sqrt(weight * s ** 2 + (1 - weight) * iv ** 2 / trading_days) / s
+    return np.where(np.isfinite(f) & (f > 0), f, 1.0)
 
 
 def var_es(log_returns, level=0.95):

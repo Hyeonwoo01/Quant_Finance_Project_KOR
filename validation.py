@@ -29,13 +29,17 @@ import market_data as md
 import regime as rg
 import repro
 import universe as uv
-from quant_engine import VAR_INNOV, VAR_INNOVS, block_bootstrap_ci, fit_vol_model, var_backtest
+from quant_engine import (VAR_INNOV, VAR_INNOVS, block_bootstrap_ci, fit_vol_model, iv_blend_factor, recal_factor,
+                          var_backtest, var_rescale)
 
 OUT_DIR = Path(__file__).parent / "validation"
 H, COST_BPS, LAG = 21, 3.0, 1          # 앱 기본 설정 (방향 예측 기간, 수수료·체결 비용 bp, 다음 날 종가 체결)
 BLOCK = 2 * H                          # 블록 부트스트랩 블록 길이 (거래일) — 포지션·변동성이 이어지는 기간보다 넉넉하게
 VAR_START = 756                        # 하루 VaR 검증 시작 위치: 첫 3년은 학습에만 쓰고 그 뒤 전체를 검증
 INDEX_NAMES = {"^KS11": "코스피 지수", "^KQ11": "코스닥 지수", "^KS200": "코스피 200 지수"}
+# 하루 VaR σ 보정 두 후보 (EXPERIMENTS.md 사전 등록 2026-10-29): 같은 GARCH 예측에 날짜별 배수만 곱해 다시 채점
+VAR_SCALES = {"recal": "크기 재보정 (C2)", "vkospi": "VKOSPI 섞기 (C1)"}
+VKOSPI_TICKERS = ("^KS11", "069500.KS")  # 코스피 200을 따르는 종목만 VKOSPI 섞기 대상
 
 
 def _ann(x):
@@ -55,6 +59,32 @@ def _quantile_loss(daily, lv):
     """날짜별 표(var_backtest detail)의 lv 수준 분위수 손실 합 (낮을수록 좋음)."""
     x, v = daily["수익률"].values, daily[f"VaR {lv:.0%}"].values
     return float(np.sum((x + v) * ((1 - lv) - (x < -v))))
+
+
+def _var_fields(m, tab):
+    """var_backtest 표 → 보고서 열 ([m] 예외 비율·검정·분위수 손실)."""
+    return {f"[{m}] VaR 95% 예외": tab.loc["하루 VaR 95%", "예외 비율"], f"[{m}] VaR 99% 예외": tab.loc["하루 VaR 99%", "예외 비율"],
+            f"[{m}] VaR 검정": "통과" if min(tab["종합 p값"]) > 0.05 else "기각",
+            f"[{m}] ES 검정": "통과" if np.nanmin(tab["ES 검정 p값"].astype(float).fillna(1.0)) > 0.05 else "기각",
+            f"[{m}] 분위수 손실": float(tab["분위수 손실(×10⁴)"].sum())}
+
+
+def _halves(daily):
+    n = len(daily) // 2
+    return (("앞 절반", daily.iloc[:n]), ("뒤 절반", daily.iloc[n:]))
+
+
+def _ql(daily):
+    return sum(_quantile_loss(daily, lv) for lv in (0.95, 0.99))
+
+
+def _vkospi_prev(dates):
+    """dates(수익률 날짜)마다 그 전 거래일 종가의 VKOSPI (예측하는 날 전날 값 → 미래 정보 없음). 받지 못하면 None."""
+    import kr_data
+    if not kr_data.get_key("KRX_API_KEY"):
+        return None
+    vk, _ = kr_data.vkospi(dates)
+    return vk.shift(1).to_numpy()
 
 
 def _without_recent(close, wf, r, tax, days):
@@ -143,16 +173,32 @@ def validate(ticker):
 
     # 하루 VaR·ES 검정 (앱 기본: 자동 = AIC로 대칭/GJR 선택). 99% VaR는 500일에 예외가 5번 정도뿐이라 검정력이 약해
     # 첫 3년(학습)을 뺀 전체 기간을 쓴다. 앞·뒤 절반의 예외 비율로 시기에 따라 흔들리는지도 본다
-    rr = r.dropna().values
+    rd = r.dropna()
+    rr = rd.values
+    vstart = max(min(VAR_START, len(rr) - 500), 250)
     # 꼬리 분포 두 후보(t, FHS)를 같은 GARCH 적합으로 함께 계산 — 앞의 본 표는 지금 기본(VAR_INNOV), 비교 표는 둘 다 (EXPERIMENTS.md 사전 등록)
-    both = var_backtest(rr, model="auto", start=max(min(VAR_START, len(rr) - 500), 250), detail=True, innov=tuple(VAR_INNOVS))
+    both = var_backtest(rr, model="auto", start=vstart, detail=True, innov=tuple(VAR_INNOVS))
     vt, vd = both[VAR_INNOV]
     for m, (tab, _) in both.items():
-        row.update({f"[{m}] VaR 95% 예외": tab.loc["하루 VaR 95%", "예외 비율"], f"[{m}] VaR 99% 예외": tab.loc["하루 VaR 99%", "예외 비율"],
-                    f"[{m}] VaR 검정": "통과" if min(tab["종합 p값"]) > 0.05 else "기각",
-                    f"[{m}] ES 검정": "통과" if np.nanmin(tab["ES 검정 p값"].astype(float).fillna(1.0)) > 0.05 else "기각",
-                    f"[{m}] 분위수 손실": float(tab["분위수 손실(×10⁴)"].sum())})
+        row.update(_var_fields(m, tab))
     row["분위수 손실 비율 (FHS ÷ t)"] = row["[fhs] 분위수 손실"] / row["[t] 분위수 손실"]
+    # σ 보정 두 후보 (사전 등록 2026-10-29): 기본(VAR_INNOV)의 같은 예측에 날짜별 배수를 곱해 다시 채점
+    factors = {"recal": recal_factor(vd["수익률"], vd["변동성"])}
+    if ticker in VKOSPI_TICKERS:
+        try:
+            iv = _vkospi_prev(rd.index[vstart:])
+            if iv is not None and np.isfinite(iv).any():
+                factors["vkospi"] = iv_blend_factor(vd["변동성"], iv)
+                row["[vkospi] VKOSPI 있는 날"] = f"{int(np.isfinite(iv).sum())}/{len(iv)}"
+        except Exception as e:
+            row["[vkospi] 오류"] = f"{type(e).__name__}: {str(e)[:80]}"
+    for m, f in factors.items():
+        tab, d = var_rescale(vt, vd, f)
+        row.update(_var_fields(m, tab))
+        row[f"[{m}] 배수 중앙값"] = float(np.median(f))
+        row[f"분위수 손실 비율 ({m} ÷ 기본)"] = _ql(d) / _ql(vd)
+        for (part, dp), (_, bp) in zip(_halves(d), _halves(vd)):
+            row[f"분위수 손실 비율 ({m} ÷ 기본) {part}"] = _ql(dp) / _ql(bp)
     # 앞·뒤 절반 각각의 분위수 손실 비율 (보고만 — 최근 급등락 구간에만 기대는지)
     for part, sl in (("앞 절반", slice(None, len(both["t"][1]) // 2)), ("뒤 절반", slice(len(both["t"][1]) // 2, None))):
         ql = {m: sum(_quantile_loss(d.iloc[sl], lv) for lv in (0.95, 0.99)) for m, (_, d) in both.items()}
@@ -194,6 +240,45 @@ def var_tail_rule(rows):
         v = [r[f"분위수 손실 비율 {part}"] for r in ok if np.isfinite(r.get(f"분위수 손실 비율 {part}", np.nan))]
         res[f"{part} 중앙값"] = float(np.median(v)) if v else np.nan
         res[f"{part} FHS가 나은 종목"] = int(sum(x < 1 for x in v))
+    return res
+
+
+def var_scale_rule(rows):
+    """하루 VaR σ 보정 사전 등록 규칙 (EXPERIMENTS.md 2026-10-29).
+    C2(크기 재보정, 모든 종목): 종목별 분위수 손실 비율(C2 ÷ 기본)의 중앙값이 전체·앞 절반·뒤 절반 모두 < 1이고
+        VaR·ES 검정 통과 종목 수가 기본보다 줄지 않으면 채택.
+    C1(VKOSPI 섞기, VKOSPI_TICKERS만): 두 종목 모두 비율이 전체·앞·뒤 절반에서 < 1이고 두 종목의 VaR·ES 통과 수가 줄지 않으면 채택.
+    둘 다 채택이면 VKOSPI_TICKERS에는 두 종목 분위수 손실 합(전체)이 낮은 쪽. 반환: 판정에 쓴 숫자와 결론 (없으면 None)."""
+    parts = ("", " 앞 절반", " 뒤 절반")
+    ok = [r for r in rows if "오류" not in r and np.isfinite(r.get("분위수 손실 비율 (recal ÷ 기본)", np.nan))]
+    if not ok:
+        return None
+    passed = lambda rs, m, k: sum(r[f"[{m}] {k}"] == "통과" for r in rs)
+    res = {"종목 수": len(ok)}
+    for p in parts:
+        res[f"C2 비율 중앙값{p}"] = float(np.median([r[f"분위수 손실 비율 (recal ÷ 기본){p}"] for r in ok]))
+    res["C2가 나은 종목"] = sum(r["분위수 손실 비율 (recal ÷ 기본)"] < 1 for r in ok)
+    for k in ("VaR 검정", "ES 검정"):
+        res[f"{k} 통과 기본"], res[f"{k} 통과 C2"] = passed(ok, "t", k), passed(ok, "recal", k)
+    res["C2 채택"] = bool(all(res[f"C2 비율 중앙값{p}"] < 1 for p in parts)
+                        and all(res[f"{k} 통과 C2"] >= res[f"{k} 통과 기본"] for k in ("VaR 검정", "ES 검정")))
+    idx = [r for r in ok if r["종목"] in VKOSPI_TICKERS and np.isfinite(r.get("분위수 손실 비율 (vkospi ÷ 기본)", np.nan))]
+    res["C1 대상"] = len(idx)
+    for r in idx:
+        for p in parts:
+            res[f"C1 {r['종목']} 비율{p}"] = r[f"분위수 손실 비율 (vkospi ÷ 기본){p}"]
+    for k in ("VaR 검정", "ES 검정"):
+        res[f"C1 {k} 통과 기본"], res[f"C1 {k} 통과 C1"] = passed(idx, "t", k), passed(idx, "vkospi", k)
+    res["C1 채택"] = bool(len(idx) == len(VKOSPI_TICKERS)
+                        and all(r[f"분위수 손실 비율 (vkospi ÷ 기본){p}"] < 1 for r in idx for p in parts)
+                        and all(res[f"C1 {k} 통과 C1"] >= res[f"C1 {k} 통과 기본"] for k in ("VaR 검정", "ES 검정")))
+    loss = {m: sum(r[f"[{m}] 분위수 손실"] for r in idx) for m in ("recal", "vkospi")} if idx else {}
+    if res["C1 채택"] and res["C2 채택"]:
+        index_pick = min(loss, key=loss.get)
+    else:
+        index_pick = "vkospi" if res["C1 채택"] else "recal" if res["C2 채택"] else None
+    res["코스피 200 종목에 쓸 것"] = VAR_SCALES[index_pick] if index_pick else "기본 그대로"
+    res["다른 종목에 쓸 것"] = VAR_SCALES["recal"] if res["C2 채택"] else "기본 그대로"
     return res
 
 
@@ -335,6 +420,30 @@ def report_markdown(rows, rank=None, when="", version="", buckets=None):
                          f"{r['[t] VaR 검정']} · {r['[fhs] VaR 검정']} | {r['[t] ES 검정']} · {r['[fhs] ES 검정']} | "
                          f"{_num(r['분위수 손실 비율 (FHS ÷ t)'], '{:.3f}')} | "
                          f"{_num(r.get('분위수 손실 비율 앞 절반', np.nan), '{:.3f}')} · {_num(r.get('분위수 손실 비율 뒤 절반', np.nan), '{:.3f}')} |")
+    sr = var_scale_rule(rows)
+    if sr:
+        lines += ["", "## 하루 VaR σ 보정: VKOSPI 섞기(C1)·크기 재보정(C2) — 사전 등록 규칙", "",
+                  "같은 GARCH 예측의 σ에 날짜별 배수만 곱합니다 (꼬리 분포는 그대로). C1은 σ² = ½ GARCH + ½ (전날 VKOSPI)², "
+                  "코스피 지수·KODEX 200만. C2는 지난 250일 z = r/σ 제곱 평균의 제곱근(0.8~1.5), 모든 종목. "
+                  "규칙은 [EXPERIMENTS.md](../EXPERIMENTS.md) (2026-10-29 사전 등록).", "",
+                  f"- C2 분위수 손실 비율(C2 ÷ 기본) 중앙값: 전체 {sr['C2 비율 중앙값']:.3f} · 앞 절반 {sr['C2 비율 중앙값 앞 절반']:.3f} · "
+                  f"뒤 절반 {sr['C2 비율 중앙값 뒤 절반']:.3f} (C2가 나은 종목 {sr['C2가 나은 종목']} / {sr['종목 수']})",
+                  f"- C2 VaR 검정 통과: 기본 {sr['VaR 검정 통과 기본']} → C2 {sr['VaR 검정 통과 C2']} · "
+                  f"ES 검정 통과: 기본 {sr['ES 검정 통과 기본']} → C2 {sr['ES 검정 통과 C2']} → **{'C2 채택' if sr['C2 채택'] else 'C2 미채택'}**",
+                  f"- C1 (대상 {sr['C1 대상']}종목): VaR 통과 {sr['C1 VaR 검정 통과 기본']} → {sr['C1 VaR 검정 통과 C1']}, "
+                  f"ES 통과 {sr['C1 ES 검정 통과 기본']} → {sr['C1 ES 검정 통과 C1']} → **{'C1 채택' if sr['C1 채택'] else 'C1 미채택'}**",
+                  f"- 결론: 코스피 지수·KODEX 200 → **{sr['코스피 200 종목에 쓸 것']}**, 다른 종목 → **{sr['다른 종목에 쓸 것']}**", "",
+                  "| 종목 | 95% 예외 기본 · C2 · C1 | 99% 예외 기본 · C2 · C1 | VaR 검정 기본 · C2 · C1 | ES 검정 기본 · C2 · C1 | "
+                  "분위수 손실 비율 C2 (전체 · 앞 · 뒤) | C1 (전체 · 앞 · 뒤) |",
+                  "|---|---|---|---|---|---|---|"]
+        three = lambda r, k, f: " · ".join(f(r[f"[{m}] {k}"]) if f"[{m}] {k}" in r else "—" for m in ("t", "recal", "vkospi"))
+        ratios = lambda r, m: " · ".join(_num(r.get(f"분위수 손실 비율 ({m} ÷ 기본){p}", np.nan), "{:.3f}") for p in ("", " 앞 절반", " 뒤 절반"))
+        for r in ok:
+            if "[recal] VaR 검정" not in r:
+                continue
+            lines.append(f"| {r['이름']} | {three(r, 'VaR 95% 예외', lambda v: _pct(v, False))} | "
+                         f"{three(r, 'VaR 99% 예외', lambda v: _pct(v, False))} | {three(r, 'VaR 검정', str)} | {three(r, 'ES 검정', str)} | "
+                         f"{ratios(r, 'recal')} | {ratios(r, 'vkospi') if '[vkospi] VaR 검정' in r else '—'} |")
     rec = [r for r in ok if "[최근1년 제외] 방향 z" in r]
     if rec:
         cnt = lambda k: sum(r[f"[최근1년 제외] {k} 하한"] > 0 for r in rec)
@@ -411,7 +520,13 @@ def run(tickers, out_dir=OUT_DIR, say=print):
                 f"  꼬리 분포 비교: 95% 예외 t {r['[t] VaR 95% 예외']:.1%}·FHS {r['[fhs] VaR 95% 예외']:.1%}, "
                 f"99% 예외 t {r['[t] VaR 99% 예외']:.1%}·FHS {r['[fhs] VaR 99% 예외']:.1%}, VaR {r['[t] VaR 검정']}·{r['[fhs] VaR 검정']}, "
                 f"ES {r['[t] ES 검정']}·{r['[fhs] ES 검정']}, 분위수 손실 비율 {r['분위수 손실 비율 (FHS ÷ t)']:.3f} "
-                f"(앞 {r.get('분위수 손실 비율 앞 절반', np.nan):.3f}·뒤 {r.get('분위수 손실 비율 뒤 절반', np.nan):.3f})"
+                f"(앞 {r.get('분위수 손실 비율 앞 절반', np.nan):.3f}·뒤 {r.get('분위수 손실 비율 뒤 절반', np.nan):.3f})\n"
+                f"  σ 보정 후보: " + ", ".join(
+                    f"{m} 95% 예외 {r[f'[{m}] VaR 95% 예외']:.1%}·VaR {r[f'[{m}] VaR 검정']}·ES {r[f'[{m}] ES 검정']}·"
+                    f"분위수 손실 비율 {r[f'분위수 손실 비율 ({m} ÷ 기본)']:.3f} "
+                    f"(앞 {r[f'분위수 손실 비율 ({m} ÷ 기본) 앞 절반']:.3f}·뒤 {r[f'분위수 손실 비율 ({m} ÷ 기본) 뒤 절반']:.3f})"
+                    for m in VAR_SCALES if f"[{m}] VaR 검정" in r)
+                + (f" | VKOSPI 오류: {r['[vkospi] 오류']}" if "[vkospi] 오류" in r else "")
                 + (f"\n  최근 1년 제외({r['[최근1년 제외] 끝']}까지): z {r['[최근1년 제외] 방향 z']:+.1f}, "
                    f"방향 초과 {r['[최근1년 제외] 방향 초과']:+.1%} [{r['[최근1년 제외] 방향 하한']:+.1%}, {r['[최근1년 제외] 방향 상한']:+.1%}], "
                    f"분할 {r['[최근1년 제외] 분할 초과']:+.1%}, 국면 {r['[최근1년 제외] 국면 초과']:+.1%}" if "[최근1년 제외] 방향 z" in r else ""))
@@ -435,4 +550,5 @@ if __name__ == "__main__":
     rows = run(["^KS11", "005930.KS"] if smoke else fl.tickers(), say=lambda m: print(m, flush=True))
     print(f"총 {time.time() - t_all:.0f}초, 실패 {sum('오류' in r for r in rows)}종목", flush=True)
     print("VaR 꼬리 분포 사전 등록 규칙:", var_tail_rule(rows), flush=True)
+    print("VaR σ 보정 사전 등록 규칙:", var_scale_rule(rows), flush=True)
     sys.exit(1 if all("오류" in r for r in rows) else 0)
