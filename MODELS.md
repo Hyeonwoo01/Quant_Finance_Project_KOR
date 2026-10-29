@@ -505,6 +505,10 @@ c_t = \mathrm{clip}\Big(\sqrt{\tfrac{1}{250}\textstyle\sum_{s=t-250}^{t-1} z_s^2
   분위수 손실은 두 종목 모두 전체·앞·뒤 절반에서 4~10% 줄었습니다.
 - **크기 재보정**: 종목별 분위수 손실 비율 중앙값이 1.010으로 나아지지 않았습니다.
 - 그래서 코스피 지수·KODEX 200의 하루 VaR(앱·실전 기록·검증 보고서)는 VKOSPI를 반반 섞어 계산합니다(`VAR_IV_TICKERS`).
+
+**예외 몰림(2026-10-29)**: 섞은 뒤에도 코스피 지수 99% VaR는 예외가 이틀 연속 나온 급락 구간 때문에 독립성 검정에서 기각됩니다.
+큰 하락 다음 날 σ가 덜 반응하는 만큼 전날 움직임 구간별로 다시 맞추는 후보(`cond_recal_factor`)를 사전 등록해 시험했습니다.
+몰림은 줄었지만(독립성 p 0.010 → 0.054) 분위수 손실이 나빠져 채택하지 않았습니다(`var_cluster_rule`).
 코드: `var_rescale`, `recal_factor`, `iv_blend_factor` (`quant_engine.py`), `vkospi` (`kr_data.py`), `var_scale_rule` (`validation.py`).
 
 ### ES 검정 (예외일 손실의 크기)
