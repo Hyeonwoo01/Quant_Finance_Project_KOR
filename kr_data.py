@@ -340,6 +340,57 @@ def parse_krx_daily(rows):
     return df.reset_index(drop=True)
 
 
+KRX_DRV_INDEX = "idx/drvprod_dd_trd"     # 파생상품지수 일별시세 (코스피 200 변동성지수 = VKOSPI가 여기 들어 있다)
+
+
+def krx_drv_index_day(day):
+    """그날의 파생상품지수 전체 (KRX 열 이름 그대로). 지난 날짜는 날짜별로 캐시한다 (휴장일의 빈 표도)."""
+    day = pd.Timestamp(day).normalize()
+    path = CACHE / "krx" / f"DRV_{day:%Y%m%d}.pkl"
+    if path.exists():
+        return pd.read_pickle(path)
+    df = pd.DataFrame(krx_api(KRX_DRV_INDEX, day))
+    if day < pd.Timestamp.now(tz="Asia/Seoul").normalize().tz_localize(None):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_pickle(path)
+    return df
+
+
+def is_vkospi(name):
+    """지수 이름이 VKOSPI(코스피 200 변동성지수)인가. 그 지수를 따르는 선물지수 등은 뺀다."""
+    n = str(name).replace(" ", "")
+    return "200" in n and "변동성" in n and not any(k in n for k in ("선물", "코스닥", "레버리지", "인버스"))
+
+
+def vkospi(dates, workers=4):
+    """날짜들의 VKOSPI 종가 (코스피 200 옵션으로 계산한 앞으로 30일 내재변동성, 연율 %). 없는 날은 NaN.
+    반환: (Series, 그 이름으로 찾은 지수 이름들) — 이름이 바뀌었거나 여럿 잡히면 알 수 있게."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(d):
+        try:
+            df = krx_drv_index_day(d)
+        except Exception:
+            return np.nan, None
+        if df.empty:
+            return np.nan, None
+        name_col = next((c for c in ("IDX_NM", "ISU_NM") if c in df), None)
+        close_col = next((c for c in ("CLSPRC_IDX", "TDD_CLSPRC", "CLSPRC") if c in df), None)
+        if name_col is None or close_col is None:
+            return np.nan, None
+        hit = df[df[name_col].map(is_vkospi)]
+        if hit.empty:
+            return np.nan, None
+        v = pd.to_numeric(str(hit[close_col].iloc[0]).replace(",", "").strip(), errors="coerce")
+        return float(v), "; ".join(hit[name_col].astype(str))
+
+    dates = pd.DatetimeIndex(dates)
+    with ThreadPoolExecutor(workers) as ex:
+        res = list(ex.map(one, dates))
+    s = pd.Series([v for v, _ in res], index=dates, name="VKOSPI")
+    return s, sorted({n for _, n in res if n})
+
+
 def krx_stock_day(day, market="STK"):
     """그날 상장돼 있던 전 종목의 일별매매정보 (나중에 상장폐지된 종목도 그날엔 들어 있다 → 생존 편향 없는 종목 범위).
 

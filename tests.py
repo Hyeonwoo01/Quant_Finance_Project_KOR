@@ -422,6 +422,19 @@ _kr = kr_data.parse_krx_daily([
 assert _kr["code"].tolist() == ["005930", "000660"] and _kr.loc[0, "close"] == 71200 and _kr.loc[0, "chg_pct"] == -1.25
 assert _kr.loc[0, "cap"] == 4.25e14 and _kr.loc[0, "shares"] == 5969782550 and np.isnan(_kr.loc[1, "close"])
 assert kr_data.parse_krx_daily([]).empty
+# VKOSPI: 파생상품지수 표에서 '코스피 200 변동성지수'만 (그 선물지수 등은 아님), 쉼표 정리, 휴장일·실패는 NaN
+assert kr_data.is_vkospi("코스피 200 변동성지수") and kr_data.is_vkospi("코스피200 변동성지수")
+assert not kr_data.is_vkospi("코스피 200 변동성지수 선물지수") and not kr_data.is_vkospi("코스피 200 선물지수")
+_drv = {"20261023": pd.DataFrame([{"IDX_NM": "코스피 200 선물지수", "CLSPRC_IDX": "1,234.5"},
+                                  {"IDX_NM": "코스피 200 변동성지수", "CLSPRC_IDX": "31.25"}]),
+        "20261024": pd.DataFrame()}
+_drv0 = kr_data.krx_drv_index_day
+kr_data.krx_drv_index_day = lambda d: _drv[pd.Timestamp(d).strftime("%Y%m%d")] if pd.Timestamp(d).day != 27 else 1 / 0
+try:
+    _vk, _vn = kr_data.vkospi(pd.to_datetime(["2026-10-23", "2026-10-24", "2026-10-27"]), workers=1)
+finally:
+    kr_data.krx_drv_index_day = _drv0
+assert _vk.iloc[0] == 31.25 and _vk.iloc[1:].isna().all() and _vn == ["코스피 200 변동성지수"]
 
 # ---------------- t분포 GARCH · 위험 지표 ----------------
 from quant_engine import GammaScalpingEngine as _GSE, max_drawdown, summarize_vol_backtest, var_es, vol_signal_backtest
