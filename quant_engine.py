@@ -736,6 +736,46 @@ def after_break(dates, prev_date=None):
     return np.asarray((d - prev).days > 1)
 
 
+def range_variance(ohlc):
+    """하루 실현 분산 추정: 밤사이 갭 (ln O_t − ln C_{t−1})² + Rogers–Satchell 장중 분산
+    ln(H/C)·ln(H/O) + ln(L/C)·ln(L/O). ohlc: Open·High·Low·Close 열의 일봉.
+    무효한 날(값 없음, 고가 < max(시가, 종가), 저가 > min(시가, 종가), 고가 = 저가, 전날 종가 없음)은 NaN."""
+    o, h, l, c = (ohlc[k].astype(float) for k in ("Open", "High", "Low", "Close"))
+    ok = (o > 0) & (h > 0) & (l > 0) & (c > 0) & (h >= np.maximum(o, c)) & (l <= np.minimum(o, c)) & (h > l)
+    rs = np.log(h / c) * np.log(h / o) + np.log(l / c) * np.log(l / o)
+    gap = np.log(o / c.shift(1)) ** 2
+    rv = (gap + rs).where(ok & gap.notna())
+    return rv.rename("RV")
+
+
+def ewma_level(x, lam=0.94, init=20):
+    """지수가중 평균 (결측인 날은 직전 값 유지). 시작값은 첫 init개 유효값의 평균, 그 전은 NaN."""
+    x = pd.Series(x, dtype=float)
+    out = np.full(len(x), np.nan)
+    valid = np.flatnonzero(x.notna().to_numpy())
+    if len(valid) < init:
+        return pd.Series(out, index=x.index)
+    k0 = valid[init - 1]
+    level = float(x.iloc[valid[:init]].mean())
+    out[k0] = level
+    for t in range(k0 + 1, len(x)):
+        v = x.iloc[t]
+        if np.isfinite(v):
+            level = lam * level + (1 - lam) * v
+        out[t] = level
+    return pd.Series(out, index=x.index)
+
+
+def range_blend_factor(sigma, rv_prev, weight=0.5):
+    """장중 고가·저가 변동성 섞기 배수: σ_섞음² = weight·σ² + (1−weight)·RVbar (전날까지의 평활 실현 분산),
+    배수 = σ_섞음 ÷ σ. 값이 없는 날은 1."""
+    s = np.asarray(sigma, float)
+    rv = np.asarray(rv_prev, float)
+    rv = np.where(rv > 0, rv, np.nan)
+    f = np.sqrt(weight * s ** 2 + (1 - weight) * rv) / s
+    return np.where(np.isfinite(f) & (f > 0), f, 1.0)
+
+
 def iv_blend_factor(sigma, iv_prev, weight=0.5, trading_days=252):
     """내재변동성 섞기 배수: σ_섞음² = weight·σ_GARCH² + (1−weight)·(IV/100)²/trading_days, 배수 = σ_섞음 ÷ σ_GARCH.
     iv_prev: 예측하는 날 전날 종가의 변동성 지수(연율 %, 예: VKOSPI). 값이 없는 날은 1 (GARCH 그대로)."""
