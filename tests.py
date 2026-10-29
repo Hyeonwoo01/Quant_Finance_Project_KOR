@@ -578,6 +578,25 @@ _mc = group_recal_factor(_mr, np.ones(300), _mb, min_obs=5)
 assert (_mc[np.flatnonzero(_mb)[:5]] == 1).all() and (_mc[np.flatnonzero(_mb)[5:]] == 1.5).all()
 assert (_mc[np.flatnonzero(~_mb)[5:]] == 0.8).all()
 assert np.array_equal(cond_recal_factor(_kr2, np.ones_like(_kr2), min_obs=3), _kc)   # K2도 같은 재보정의 한 경우
+# 장중 고가·저가 변동성(R1): 밤사이 갭² + Rogers–Satchell. 장중을 잘게 쪼갠 모의 주가에서 실제 분산 근처(이산 관측이라 조금 작음)
+from quant_engine import ewma_level, range_blend_factor, range_variance
+_rg = np.random.default_rng(4)
+_ohlc_rows, _cp = [], 100.0
+for _t in range(1500):
+    _o = _cp * np.exp(0.003 * _rg.standard_normal())
+    _path = _o * np.exp(np.cumsum(np.sqrt((0.01 ** 2 - 0.003 ** 2) / 200) * _rg.standard_normal(200)))
+    _ohlc_rows.append((_o, max(_o, _path.max()), min(_o, _path.min()), _path[-1]))
+    _cp = _path[-1]
+_ohlc = pd.DataFrame(_ohlc_rows, columns=["Open", "High", "Low", "Close"], index=pd.bdate_range("2019-01-01", periods=1500))
+_rv = range_variance(_ohlc)
+assert np.isnan(_rv.iloc[0]) and 0.8 < _rv.mean() / 1e-4 < 1.05                 # 첫날은 전날 종가가 없어 NaN
+_oh2 = _ohlc.copy()
+_oh2.iloc[10, 1] = _oh2.iloc[10, 3] * 0.99                                       # 고가 < 종가 → 무효
+_oh2.iloc[11, 2] = _oh2.iloc[11, 1]                                              # 고가 = 저가 → 무효
+assert range_variance(_oh2).iloc[10:12].isna().all() and np.isfinite(range_variance(_oh2).iloc[12])
+_ew = ewma_level(pd.Series([np.nan] + [1.0] * 19 + [2.0, np.nan, 3.0]), lam=0.5, init=19)
+assert np.isnan(_ew.iloc[18]) and _ew.iloc[19] == 1.0 and _ew.iloc[20] == 1.5 and _ew.iloc[21] == 1.5 and _ew.iloc[22] == 2.25
+assert np.allclose(range_blend_factor([0.01, 0.01, 0.01, 0.01], [1e-4, 4e-4, np.nan, 0.0]), [1, np.sqrt(2.5), 1, 1])
 # VKOSPI 섞기: σ² = ½ GARCH + ½ (IV/100)²/252. IV가 GARCH와 같으면 1, 두 배면 √2.5, 없거나 0이면 1
 _ivd = 100 * 0.01 * np.sqrt(252)
 assert np.allclose(iv_blend_factor(np.full(4, 0.01), np.array([np.nan, 0.0, _ivd, 2 * _ivd])), [1, 1, 1, np.sqrt(2.5)])
@@ -1171,7 +1190,7 @@ assert uv.load_krx(Path(tempfile.gettempdir()) / "없는파일.pkl") is None
 
 # ---------------- 실제 데이터 검증 보고서 (데이터는 합성으로 바꿔 끼움) ----------------
 import validation as vd
-_orig_v = {k: getattr(md, k) for k in ("load_history", "load_macro", "kr_info")}
+_orig_v = {k: getattr(md, k) for k in ("load_history", "load_macro", "kr_info", "load_ohlc")}
 _orig_va = ad.build_alt_features
 _hist = pd.Series(100 * np.exp(np.cumsum(0.0004 + 0.012 * np.random.default_rng(5).standard_normal(1800))),
                   index=pd.bdate_range("2019-01-02", periods=1800))
@@ -1180,6 +1199,11 @@ def _hist_or_fail(t, years):
         raise ValueError("주가 데이터 없음")
     return _hist
 md.load_history = _hist_or_fail
+_hrg = np.random.default_rng(6)                                    # 종가에 맞춘 시가·고가·저가 (R1 계산용)
+_hopen = _hist.shift(1).bfill() * np.exp(0.002 * _hrg.standard_normal(len(_hist)))
+_hohlc = pd.DataFrame({"Open": _hopen, "High": np.maximum(_hopen, _hist) * (1 + 0.005 * np.abs(_hrg.standard_normal(len(_hist)))),
+                       "Low": np.minimum(_hopen, _hist) * (1 - 0.005 * np.abs(_hrg.standard_normal(len(_hist)))), "Close": _hist})
+md.load_ohlc = lambda t, years: _hohlc
 md.load_macro = lambda t, years=10: None
 md.kr_info = lambda t: ("테스트전자", "KOSPI", "stock")
 ad.build_alt_features = lambda t, idx: (None, {})
@@ -1213,6 +1237,8 @@ try:
     assert 0 <= _vr["[k2] 99% 독립성 p"] <= 1 and 0 <= _vr["[cur] 95% 독립성 p"] <= 1
     assert _vr["[m1] VaR 검정"] in ("통과", "기각") and all(np.isfinite(_vr[f"분위수 손실 비율 (m1 ÷ 현재){_p}"]) for _p in ("", " 앞 절반", " 뒤 절반"))
     assert 0 <= _vr["[cur] 휴장 뒤 95% 예외"] <= 1 and 0 <= _vr["[m1] 휴장 뒤 95% 예외"] <= 1
+    assert _vr["[r1] 유효한 날 비율"] == 1.0 and _vr["[r1] VaR 검정"] in ("통과", "기각")
+    assert all(np.isfinite(_vr[f"분위수 손실 비율 (r1 ÷ 현재){_p}"]) for _p in ("", " 앞 절반", " 뒤 절반"))
     # 사전 등록 규칙: 분위수 손실 비율 중앙값 < 1 이고 VaR·ES 통과 수가 줄지 않을 때만 FHS
     _mk = lambda ratio, vt_, vf, et, ef: {"[t] VaR 검정": vt_, "[fhs] VaR 검정": vf, "[t] ES 검정": et, "[fhs] ES 검정": ef,
                                           "분위수 손실 비율 (FHS ÷ t)": ratio}
@@ -1288,11 +1314,19 @@ try:
         assert "## 하루 VaR 꼬리 분포 비교" in _md and "판정:" in _md and "앞 절반" in _md
         assert "## 하루 VaR σ 보정" in _md and ("**C2 채택**" in _md or "**C2 미채택**" in _md)
         assert "## 하루 VaR 예외 몰림" in _md and ("나머지 1종목" in _md) and "## 하루 VaR 휴장 뒤 첫 거래일" in _md
+        assert "## 하루 VaR 장중 고가·저가 변동성 섞기(R1)" in _md
         assert "## 최근 1년(이례적 급등락 구간)을 뺀 결과" in _md
         assert _rows[0]["VaR σ 보정"] == "없음" and _rows[0]["VaR 검정"] == _rows[0]["[t] VaR 검정"]   # 대상이 아니면 본 표 = 기본(t)
         assert _rows[0]["VaR 95% 예외 비율"] == _rows[0]["[t] VaR 95% 예외"]
         _sv = pd.read_csv(Path(_vd) / "summary.csv")
         assert len(_sv) == 2 and pd.isna(_sv.loc[0, "오류"]) and "주가 데이터 없음" in _sv.loc[1, "오류"]
+    # 유효한 일봉이 80% 미만이면 R1은 비교하지 않고 비율만 남김 (규칙의 '비교 못 한 종목')
+    _bad = _hohlc.copy()
+    _bad.loc[_bad.index[len(_bad) // 3:], "High"] = _bad["Low"]                   # 뒤쪽 2/3: 고가 = 저가 → 무효
+    md.load_ohlc = lambda t, years: _bad
+    _vb = vd.validate("005930.KS")
+    assert _vb["[r1] 유효한 날 비율"] < vd.R1_MIN_VALID and "[r1] VaR 검정" not in _vb
+    assert vd.var_cluster_rule([_vr, _vb], "r1")["비교 못 한 종목"] == ["005930.KS"]
 finally:
     for _k, _v in _orig_v.items():
         setattr(md, _k, _v)

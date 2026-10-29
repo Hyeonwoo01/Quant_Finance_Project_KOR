@@ -30,7 +30,8 @@ import regime as rg
 import repro
 import universe as uv
 from quant_engine import (VAR_INNOV, VAR_INNOVS, VAR_IV_TICKERS, after_break, block_bootstrap_ci, cond_recal_factor,
-                          fit_vol_model, group_recal_factor, iv_blend_factor, recal_factor, var_backtest, var_rescale)
+                          ewma_level, fit_vol_model, group_recal_factor, iv_blend_factor, range_blend_factor,
+                          range_variance, recal_factor, var_backtest, var_rescale)
 
 OUT_DIR = Path(__file__).parent / "validation"
 H, COST_BPS, LAG = 21, 3.0, 1          # 앱 기본 설정 (방향 예측 기간, 수수료·체결 비용 bp, 다음 날 종가 체결)
@@ -206,6 +207,15 @@ def validate(ticker):
     # 지금 기본(위의 vt·vd)에 곱하는 후보 (사전 등록 2026-10-29): K2 = 전날 움직임 구간별, M1 = 휴장 뒤 첫 거래일 여부별 재보정
     brk = after_break(rd.index[vstart:], rd.index[vstart - 1])
     cands = {"k2": cond_recal_factor(vd["수익률"], vd["변동성"]), "m1": group_recal_factor(vd["수익률"], vd["변동성"], brk)}
+    # R1 (사전 등록 2026-10-29): 장중 고가·저가 변동성(밤사이 갭 + Rogers–Satchell, EWMA 0.94)을 반반 섞음. 유효한 날이 80% 미만이면 빼고 보고
+    try:
+        rv = range_variance(md.load_ohlc(ticker, 10)).reindex(rd.index)
+        vdays = rd.index[vstart:]
+        row["[r1] 유효한 날 비율"] = float(rv.reindex(vdays).notna().mean())
+        if row["[r1] 유효한 날 비율"] >= R1_MIN_VALID:
+            cands["r1"] = range_blend_factor(vd["변동성"], ewma_level(rv).shift(1).reindex(vdays).to_numpy())
+    except Exception as e:
+        row["[r1] 오류"] = f"{type(e).__name__}: {str(e)[:80]}"
     tabs = {"cur": (vt, vd), **{m: var_rescale(vt, vd, f) for m, f in cands.items()}}
     for m, (tab, d) in tabs.items():
         row.update(_var_fields(m, tab))
@@ -299,7 +309,8 @@ def var_scale_rule(rows):
     return res
 
 
-VAR_GROUP_CANDS = {"k2": "K2", "m1": "M1"}     # 지금 기본에 곱하는 재보정 후보 (같은 규칙으로 따로 판정)
+VAR_GROUP_CANDS = {"k2": "K2", "m1": "M1", "r1": "R1"}     # 지금 기본에 곱하는 후보 (같은 규칙으로 따로 판정)
+R1_MIN_VALID = 0.8                                          # R1: 검증 기간에 유효한 일봉(시가·고가·저가)이 이보다 적으면 비교에서 뺌
 
 
 def var_cluster_rule(rows, m="k2"):
@@ -315,7 +326,8 @@ def var_cluster_rule(rows, m="k2"):
     passed = lambda rs, mm, k: sum(r[f"[{mm}] {k}"] == "통과" for r in rs)
     idx = [r for r in ok if r["종목"] in VKOSPI_TICKERS]
     rest = [r for r in ok if r["종목"] not in VKOSPI_TICKERS]
-    res = {"후보": name, "코스피 200 종목 수": len(idx), "나머지 종목 수": len(rest)}
+    res = {"후보": name, "코스피 200 종목 수": len(idx), "나머지 종목 수": len(rest),
+           "비교 못 한 종목": [r["종목"] for r in rows if "오류" not in r and not np.isfinite(r.get(ratio, np.nan))]}
     for r in idx:
         for p in parts:
             res[f"{r['종목']} 비율{p}"] = r[f"{ratio}{p}"]
@@ -342,7 +354,11 @@ VAR_GROUP_TEXT = {
            "지금 기본의 σ에 곱합니다 (큰 하락 다음 날 σ가 덜 반응하는 만큼)."),
     "m1": ("하루 VaR 휴장 뒤 첫 거래일(월요일 등) 보정(M1)",
            "그날이 휴장 뒤 첫 거래일(바로 전 거래일과 달력상 2일 넘게 떨어짐: 월요일·연휴 다음 날)인지로 두 묶음을 나누고, "
-           "그날 전까지 같은 묶음이었던 날들의 z² 평균의 제곱근(0.8~1.5)을 지금 기본의 σ에 곱합니다 (쉬는 동안 쌓인 소식만큼).")}
+           "그날 전까지 같은 묶음이었던 날들의 z² 평균의 제곱근(0.8~1.5)을 지금 기본의 σ에 곱합니다 (쉬는 동안 쌓인 소식만큼)."),
+    "r1": ("하루 VaR 장중 고가·저가 변동성 섞기(R1)",
+           "하루 실현 분산 = 밤사이 갭² + Rogers–Satchell 장중 분산(시가·고가·저가·종가), 지수가중 평균(0.94)을 내어 "
+           "σ² = ½ 지금 기본 + ½ 장중 실현 분산으로 섞습니다 (종가만으로는 모르는 장중 흔들림). "
+           f"유효한 일봉이 {R1_MIN_VALID:.0%} 미만인 종목은 비교에서 뺍니다.")}
 
 
 def _group_rule_lines(rows, m):
@@ -364,6 +380,8 @@ def _group_rule_lines(rows, m):
               f"앞 {_num(cr['나머지 비율 중앙값 앞 절반'], '{:.3f}')} · 뒤 {_num(cr['나머지 비율 중앙값 뒤 절반'], '{:.3f}')} "
               f"(나은 종목 {cr[f'나머지 {name}가 나은 종목']}), VaR 통과 {ci('나머지', 'VaR 검정')}, ES 통과 {ci('나머지', 'ES 검정')}, "
               f"휴장 뒤 95% 예외 평균 {bk('나머지')} → **{f'{name} 채택' if cr[f'나머지 {name} 채택'] else f'{name} 미채택'}**"]
+    if cr["비교 못 한 종목"]:
+        lines.append(f"- 비교 못 한 종목 (데이터 부족·오류): {', '.join(cr['비교 못 한 종목'])}")
     return lines
 
 
@@ -620,7 +638,7 @@ def run(tickers, out_dir=OUT_DIR, say=print):
                           f"VaR {r['[cur] VaR 검정']} → {r[f'[{m}] VaR 검정']}, ES {r['[cur] ES 검정']} → {r[f'[{m}] ES 검정']}, "
                           f"분위수 손실 비율 {r[f'분위수 손실 비율 ({m} ÷ 현재)']:.3f} "
                           f"(앞 {r[f'분위수 손실 비율 ({m} ÷ 현재) 앞 절반']:.3f}·뒤 {r[f'분위수 손실 비율 ({m} ÷ 현재) 뒤 절반']:.3f})"
-                          for m, n in VAR_GROUP_CANDS.items())
+                          for m, n in VAR_GROUP_CANDS.items() if f"[{m}] VaR 검정" in r)
                 + (f"\n  최근 1년 제외({r['[최근1년 제외] 끝']}까지): z {r['[최근1년 제외] 방향 z']:+.1f}, "
                    f"방향 초과 {r['[최근1년 제외] 방향 초과']:+.1%} [{r['[최근1년 제외] 방향 하한']:+.1%}, {r['[최근1년 제외] 방향 상한']:+.1%}], "
                    f"분할 {r['[최근1년 제외] 분할 초과']:+.1%}, 국면 {r['[최근1년 제외] 국면 초과']:+.1%}" if "[최근1년 제외] 방향 z" in r else ""))

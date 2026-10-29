@@ -34,6 +34,16 @@ def load_history(ticker, years):
     return close
 
 
+def load_ohlc(ticker, years):
+    """Yahoo 일봉 시가·고가·저가·종가 (배당·분할 수정). 장중 고가·저가로 하루 변동성을 잴 때 쓴다 (quant_engine.range_variance)."""
+    h = yf.Ticker(ticker).history(period=f"{years}y", auto_adjust=True)
+    if h.empty:
+        raise ValueError(f"'{ticker}'의 일봉(시가·고가·저가)을 찾을 수 없습니다.")
+    h = h[["Open", "High", "Low", "Close"]].copy()
+    h.index = h.index.tz_localize(None)
+    return h
+
+
 # 한국 지수의 네이버 차트 기호. 코스피200(^KS200)은 Yahoo가 최근 1개월 요청에 1일치만 줘서(2026-10 점검) 네이버를 먼저 쓴다.
 NAVER_INDEX = {"^KS11": "KOSPI", "^KQ11": "KOSDAQ", "^KS200": "KPI200"}
 NAVER_FIRST = {"^KS200"}
