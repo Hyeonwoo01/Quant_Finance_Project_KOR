@@ -850,6 +850,17 @@ assert len(fl.drop_unfinished(_kd, "005930.KS", _utc("2026-10-23T08:37"))) == 2 
 assert len(fl.drop_unfinished(_kd, "SPY", _utc("2026-10-23T16:00"))) == 1            # 뉴욕 정오 = 장중 → 뺌
 assert len(fl.drop_unfinished(_kd, "SPY", _utc("2026-10-24T08:37"))) == 2            # 다음 날 새벽 → 그대로
 assert len(fl.drop_unfinished(_kd, "^KS11", _utc("2026-10-23T01:00"))) == 1          # 코스피 지수도 한국 장 기준
+# Yahoo가 마지막 거래일 일봉을 빼고 줄 때(늦어진 예약 실행이 한국 자정을 넘김): 네이버 종가로 그 뒤 날짜만 덧붙임
+assert fl.naver_symbol("005930.KS") == "005930" and fl.naver_symbol("247540.KQ") == "247540" and fl.naver_symbol("^KS11") == "KOSPI"
+assert fl.naver_symbol("SPY") is None
+_yh = pd.Series([100.0, 101.0], index=pd.to_datetime(["2026-10-26", "2026-10-27"]))
+_nv = pd.Series([100.0, 101.0, 103.0], index=pd.to_datetime(["2026-10-26", "2026-10-27", "2026-10-28"]))
+_fr = fl.fill_recent(_yh, "005930.KS", fetch=lambda s: _nv)
+assert list(_fr.index.strftime("%m-%d")) == ["10-26", "10-27", "10-28"] and _fr.iloc[-1] == 103.0
+assert fl.fill_recent(_yh, "005930.KS", fetch=lambda s: _nv * 1.02).equals(_yh)          # 겹치는 날 종가가 다르면(배당 수정 등) 그대로
+assert fl.fill_recent(_yh, "SPY", fetch=lambda s: 1 / 0).equals(_yh)                     # 한국 종목·지수가 아니면 그대로
+assert fl.fill_recent(_yh, "005930.KS", fetch=lambda s: 1 / 0).equals(_yh)               # 받지 못하면 그대로
+assert fl.fill_recent(_nv, "005930.KS", fetch=lambda s: _nv).equals(_nv)                 # 이미 최신이면 그대로
 # Cboe 변동성 지수 CSV (Yahoo에 없는 RVX 등)
 _cb = md.parse_cboe_csv("DATE,OPEN,HIGH,LOW,CLOSE\n10/21/2026,20.1,21.0,19.5,20.5\n10/22/2026,20.5,22.0,20.0,21.25\n")
 assert list(_cb.index.strftime("%Y-%m-%d")) == ["2026-10-21", "2026-10-22"] and _cb.iloc[-1] == 21.25

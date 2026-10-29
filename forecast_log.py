@@ -67,9 +67,39 @@ def read_log(path=LOG_PATH):
     return log
 
 
+def naver_symbol(ticker):
+    """네이버 차트 기호: 한국 지수는 KOSPI 등, 한국 종목·ETF는 6자리 코드. 그 밖(미국 등)은 None."""
+    t = ticker.upper()
+    if t in md.NAVER_INDEX:
+        return md.NAVER_INDEX[t]
+    code, _, mkt = t.partition(".")
+    return code if mkt in ("KS", "KQ") and len(code) == 6 else None
+
+
+def fill_recent(close, ticker, fetch=None):
+    """Yahoo 일봉이 마지막 거래일을 아직 안 줄 때(한국 자정 무렵 등) 네이버 차트에서 그 뒤 날짜의 종가만 덧붙인다.
+
+    예약 실행이 몇 시간 늦어져 한국 자정을 넘기면 Yahoo가 그날 일봉을 잠시 빼고 줘서, 그날 기록을 '이미 있음'으로 건너뛴 일이 있었다
+    (2026-10-26·28). 겹치는 마지막 날 종가가 0.5% 안에서 같을 때만 붙인다 (배당 수정 등으로 다르면 그대로 둔다).
+    fetch: 기호 → 네이버 종가 Series (테스트용으로 바꿔 끼움). 실패하면 원래 시세를 그대로 돌려준다."""
+    sym = naver_symbol(ticker)
+    if sym is None or close.empty:
+        return close
+    try:
+        nv = fetch(sym) if fetch else md.parse_naver_chart(
+            md.requests.get(md.NAVER_CHART.format(sym, 10), headers=md._UA, timeout=20).text)
+    except Exception:
+        return close
+    last = close.index[-1]
+    if last not in nv.index or abs(nv[last] / close.iloc[-1] - 1) > 0.005:
+        return close
+    newer = nv[nv.index > last]
+    return pd.concat([close, newer]) if len(newer) else close
+
+
 def predict(ticker, h=H, have=frozenset()):
     """앱 기본 설정과 같은 계산으로 오늘(마지막 종가 기준)의 예측 한 줄. 그 날짜가 이미 기록돼 있으면(휴장일 등) skip 표시만."""
-    close = drop_unfinished(md.load_history(ticker, 10), ticker)
+    close = drop_unfinished(fill_recent(md.load_history(ticker, 10), ticker), ticker)
     asof, spot = close.index[-1], float(close.iloc[-1])
     row = {"asof": asof.date().isoformat(), "ticker": ticker, "close": spot, "h": h, "data_fp": repro.fingerprint(close)}
     if (row["asof"], ticker) in have:
