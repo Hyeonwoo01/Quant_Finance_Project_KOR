@@ -704,21 +704,36 @@ def recal_factor(returns, sigma, window=250, min_obs=125, clip=(0.8, 1.5)):
     return c.clip(*clip).fillna(1.0).to_numpy()
 
 
+def group_recal_factor(returns, sigma, groups, min_obs=30, clip=(0.8, 1.5)):
+    """묶음별 σ 재보정 배수: 그날 전까지 같은 묶음이었던 날들의 표준화 수익률 z = r/σ의 제곱 평균의 제곱근
+    (그날은 넣지 않음 → 미래 정보 없음). 그 묶음의 지난 날이 min_obs보다 적으면 1, clip으로 자른다.
+    groups: 날짜별 묶음 이름 (예: 전날 움직임 구간, 휴장 뒤 첫 거래일 여부)."""
+    z = np.asarray(returns, float) / np.asarray(sigma, float)
+    total, count, out = {}, {}, np.ones(len(z))
+    for t, k in enumerate(groups):
+        if count.get(k, 0) >= min_obs:
+            out[t] = min(max(np.sqrt(total[k] / count[k]), clip[0]), clip[1])
+        if np.isfinite(z[t]):
+            total[k] = total.get(k, 0.0) + z[t] ** 2
+            count[k] = count.get(k, 0) + 1
+    return out
+
+
 def cond_recal_factor(returns, sigma, threshold=1.0, min_obs=30, clip=(0.8, 1.5)):
-    """전날 움직임별 σ 재보정 배수: 전날 표준화 수익률 z_{t−1} = r/σ를 세 구간(< −threshold, 사이, > threshold)으로 나누고,
-    그날 전까지 같은 구간이었던 날들의 z² 평균의 제곱근을 곱한다 (그날은 넣지 않음 → 미래 정보 없음).
-    큰 하락 다음 날 실제 움직임이 예측보다 꾸준히 크면 그만큼 키운다. 그 구간의 지난 날이 min_obs보다 적으면 1, clip으로 자른다."""
+    """전날 움직임별 σ 재보정 배수: 전날 표준화 수익률 z_{t−1} = r/σ를 세 구간(< −threshold, 사이, > threshold)으로 나눠
+    group_recal_factor. 큰 하락 다음 날 실제 움직임이 예측보다 꾸준히 크면 그만큼 키운다."""
     z = np.asarray(returns, float) / np.asarray(sigma, float)
     prev = np.r_[np.nan, z[:-1]]
     bucket = np.where(prev < -threshold, 0, np.where(prev > threshold, 2, 1))
-    total, count, out = np.zeros(3), np.zeros(3), np.ones(len(z))
-    for t, k in enumerate(bucket):
-        if count[k] >= min_obs:
-            out[t] = min(max(np.sqrt(total[k] / count[k]), clip[0]), clip[1])
-        if np.isfinite(z[t]):
-            total[k] += z[t] ** 2
-            count[k] += 1
-    return out
+    return group_recal_factor(returns, sigma, bucket, min_obs, clip)
+
+
+def after_break(dates, prev_date=None):
+    """날짜마다 휴장 뒤 첫 거래일인가 (바로 전 거래일과 달력상 2일 넘게 떨어짐: 월요일·연휴 다음 날).
+    prev_date: 첫 날짜 바로 전 거래일 (없으면 첫날은 아님으로)."""
+    d = pd.DatetimeIndex(dates)
+    prev = pd.DatetimeIndex([prev_date if prev_date is not None else d[0]]).append(d[:-1])
+    return np.asarray((d - prev).days > 1)
 
 
 def iv_blend_factor(sigma, iv_prev, weight=0.5, trading_days=252):

@@ -566,6 +566,18 @@ assert np.isclose(_kc[_mid[-1]], min(1.5, np.sqrt(np.mean(_kr2[_mid[:-1]] ** 2))
 _kr3 = _kr2.copy()
 _kr3[150:] *= 3
 assert np.array_equal(cond_recal_factor(_kr3, np.ones_like(_kr3), min_obs=3)[:151], _kc[:151])   # 그날 이후 값은 영향 없음
+# 휴장 뒤 첫 거래일(M1): 바로 전 거래일과 달력상 2일 넘게 떨어진 날(월요일·연휴 다음 날)과 그 밖의 날을 따로 재보정
+from quant_engine import after_break, group_recal_factor
+_bd = pd.to_datetime(["2026-10-23", "2026-10-26", "2026-10-27", "2026-10-29", "2026-10-30"])
+assert after_break(_bd, pd.Timestamp("2026-10-22")).tolist() == [False, True, False, True, False]
+_mdays = pd.bdate_range("2025-01-06", periods=300)
+_mb = after_break(_mdays, _mdays[0] - pd.Timedelta(days=3))
+assert _mb.sum() == 60 and _mb[0] and not _mb[1]                       # 월요일마다 (첫날도 금요일 다음 월요일)
+_mr = np.where(_mb, 2.0, 0.5) * np.where(np.arange(300) % 2, 1, -1)      # σ = 1: 월요일은 |z| = 2, 나머지는 0.5
+_mc = group_recal_factor(_mr, np.ones(300), _mb, min_obs=5)
+assert (_mc[np.flatnonzero(_mb)[:5]] == 1).all() and (_mc[np.flatnonzero(_mb)[5:]] == 1.5).all()
+assert (_mc[np.flatnonzero(~_mb)[5:]] == 0.8).all()
+assert np.array_equal(cond_recal_factor(_kr2, np.ones_like(_kr2), min_obs=3), _kc)   # K2도 같은 재보정의 한 경우
 # VKOSPI 섞기: σ² = ½ GARCH + ½ (IV/100)²/252. IV가 GARCH와 같으면 1, 두 배면 √2.5, 없거나 0이면 1
 _ivd = 100 * 0.01 * np.sqrt(252)
 assert np.allclose(iv_blend_factor(np.full(4, 0.01), np.array([np.nan, 0.0, _ivd, 2 * _ivd])), [1, 1, 1, np.sqrt(2.5)])
@@ -1199,6 +1211,8 @@ try:
     assert _vr["[cur] VaR 검정"] == _vr["VaR 검정"] and _vr["[k2] VaR 검정"] in ("통과", "기각")
     assert all(np.isfinite(_vr[f"분위수 손실 비율 (k2 ÷ 현재){_p}"]) for _p in ("", " 앞 절반", " 뒤 절반"))
     assert 0 <= _vr["[k2] 99% 독립성 p"] <= 1 and 0 <= _vr["[cur] 95% 독립성 p"] <= 1
+    assert _vr["[m1] VaR 검정"] in ("통과", "기각") and all(np.isfinite(_vr[f"분위수 손실 비율 (m1 ÷ 현재){_p}"]) for _p in ("", " 앞 절반", " 뒤 절반"))
+    assert 0 <= _vr["[cur] 휴장 뒤 95% 예외"] <= 1 and 0 <= _vr["[m1] 휴장 뒤 95% 예외"] <= 1
     # 사전 등록 규칙: 분위수 손실 비율 중앙값 < 1 이고 VaR·ES 통과 수가 줄지 않을 때만 FHS
     _mk = lambda ratio, vt_, vf, et, ef: {"[t] VaR 검정": vt_, "[fhs] VaR 검정": vf, "[t] ES 검정": et, "[fhs] ES 검정": ef,
                                           "분위수 손실 비율 (FHS ÷ t)": ratio}
@@ -1240,6 +1254,12 @@ try:
     _q2 = vd.var_cluster_rule([_mk2("005930.KS", _gd), _mk2("000660.KS", _gd), _mk2("035420.KS", _bd)])
     assert _q2["나머지 K2 채택"] and not _q2["코스피 200 K2 채택"] and _q2["나머지 K2가 나은 종목"] == 3
     assert not vd.var_cluster_rule([_mk2("005930.KS", _gd, vk="기각"), _mk2("000660.KS", _gd)])["나머지 K2 채택"]
+    # 휴장 뒤 첫 거래일 M1도 같은 규칙 (열 이름만 m1)
+    _mm = lambda t, x, **kw: {k.replace("k2", "m1"): v for k, v in _mk2(t, x, **kw).items()}
+    _q3 = vd.var_cluster_rule([_mm("^KS11", _gd), _mm("069500.KS", _gd), _mm("005930.KS", _bd), _mm("000660.KS", _bd),
+                               _mm("035420.KS", _gd)], "m1")
+    assert _q3["코스피 200 M1 채택"] and not _q3["나머지 M1 채택"] and _q3["나머지 비율 중앙값 앞 절반"] == 1.01
+    assert vd.var_cluster_rule([_mk2("005930.KS", _gd)], "m1") is None                  # M1 열이 없으면 판정 없음
     # 전날 VKOSPI: 수익률 날짜마다 그 전 거래일 값 (첫날은 없음)
     _gk0, _vk0 = kr_data.get_key, kr_data.vkospi
     kr_data.get_key = lambda n: "x"
@@ -1267,7 +1287,7 @@ try:
         assert "## 21일 분할 보유 전략" in _md and "## 예측 확률 구간별 실제 21일 수익" in _md and "## 하루 VaR·ES 검정" in _md
         assert "## 하루 VaR 꼬리 분포 비교" in _md and "판정:" in _md and "앞 절반" in _md
         assert "## 하루 VaR σ 보정" in _md and ("**C2 채택**" in _md or "**C2 미채택**" in _md)
-        assert "## 하루 VaR 예외 몰림" in _md and ("나머지 1종목" in _md)
+        assert "## 하루 VaR 예외 몰림" in _md and ("나머지 1종목" in _md) and "## 하루 VaR 휴장 뒤 첫 거래일" in _md
         assert "## 최근 1년(이례적 급등락 구간)을 뺀 결과" in _md
         assert _rows[0]["VaR σ 보정"] == "없음" and _rows[0]["VaR 검정"] == _rows[0]["[t] VaR 검정"]   # 대상이 아니면 본 표 = 기본(t)
         assert _rows[0]["VaR 95% 예외 비율"] == _rows[0]["[t] VaR 95% 예외"]
