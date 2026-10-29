@@ -499,6 +499,12 @@ c_t = \mathrm{clip}\Big(\sqrt{\tfrac{1}{250}\textstyle\sum_{s=t-250}^{t-1} z_s^2
 ```
 
 판정은 분위수 손실 비율(후보 ÷ 기본)을 전체·앞 절반·뒤 절반으로 나눠 보고, VaR·ES 검정 통과 수가 줄지 않는지로 합니다(규칙은 EXPERIMENTS.md).
+
+**실제 35종목 결과(2026-10-29): VKOSPI 섞기 채택, 크기 재보정 미채택.**
+- **VKOSPI 섞기**: 코스피 지수의 95% 예외가 7.0% → 5.1%, 99% 예외가 2.0% → 1.0%였습니다. KODEX 200은 7.1% → 5.5%, 1.7% → 1.3%였습니다.
+  분위수 손실은 두 종목 모두 전체·앞·뒤 절반에서 4~10% 줄었습니다.
+- **크기 재보정**: 종목별 분위수 손실 비율 중앙값이 1.010으로 나아지지 않았습니다.
+- 그래서 코스피 지수·KODEX 200의 하루 VaR(앱·실전 기록·검증 보고서)는 VKOSPI를 반반 섞어 계산합니다(`VAR_IV_TICKERS`).
 코드: `var_rescale`, `recal_factor`, `iv_blend_factor` (`quant_engine.py`), `vkospi` (`kr_data.py`), `var_scale_rule` (`validation.py`).
 
 ### ES 검정 (예외일 손실의 크기)

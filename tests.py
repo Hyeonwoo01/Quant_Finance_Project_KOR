@@ -834,6 +834,17 @@ try:
     _cut["n"] = 1100
     assert np.isclose(fl.predict("SPY")["p_up"], _row["p_up"]) and np.isclose(fl.predict("SPY")["lo68"], _row["lo68"])
     assert _row["lo95"] < _row["lo68"] < _row["close"] < _row["hi68"] < _row["hi95"] and 0 < _row["var95_1d"] < _row["var99_1d"]
+    # 코스피 200 종목의 하루 VaR: GARCH와 그날 VKOSPI를 반반 섞은 σ → 하루 로그수익률 분위수가 같은 배수로 커짐 (21일 범위는 그대로)
+    _base = fl.predict("SPY")
+    assert np.isnan(_base["var_vkospi"])                              # 대상 종목이 아니면 섞지 않음
+    _ivt0, _vko0 = fl.VAR_IV_TICKERS, kr_data.vkospi_on
+    fl.VAR_IV_TICKERS, kr_data.vkospi_on = ("SPY",), lambda d: 200.0
+    try:
+        _bl = fl.predict("SPY")
+    finally:
+        fl.VAR_IV_TICKERS, kr_data.vkospi_on = _ivt0, _vko0
+    _c95, _c99 = (np.log1p(-_bl[k]) / np.log1p(-_base[k]) for k in ("var95_1d", "var99_1d"))
+    assert _bl["var_vkospi"] == 200.0 and _c95 > 1 and np.isclose(_c95, _c99, rtol=1e-9) and _bl["lo68"] == _base["lo68"]
     # 시장 심리 지표도 앱과 같은 값으로 저장 (뉴스는 가장 최근 헤드라인 기준 7일: 1/20 하나만)
     assert _row["pc_oi"] == 1.5 and _row["eps_rev_30d"] == 0.01 and _row["news_7d"] == 0.25 and _row["news_n"] == 1
 finally:
@@ -1167,7 +1178,10 @@ try:
     assert _vr["분할 초과 95% 하한"] <= _vr["분할 초과수익(연)"] <= _vr["분할 초과 95% 상한"] and 0 < _vr["분할 보유 평균 비중"] <= 1
     assert len(_vr["_obs"]) > 0 and (_vr["_obs"]["c"] >= 2 * vd.COST_BPS * 1e-4).all()      # 비용 = 수수료 양쪽 + 세금
     assert _vr["ES 검정"] in ("통과", "기각") and _vr["VaR 검증 일수"] > 500 and _vr["GARCH 진단"].count("수렴") == 1
-    assert _vr["[t] VaR 검정"] == _vr["VaR 검정"] and _vr["분위수 손실 비율 (FHS ÷ t)"] > 0          # 기본(t)의 본 표 = 비교 표의 t
+    assert _vr["분위수 손실 비율 (FHS ÷ t)"] > 0
+    # VKOSPI 섞기 대상 종목은 본 표가 섞은 VaR (2026-10-29 판정), 아니면 기본(t) 그대로
+    assert _vr["VaR σ 보정"] == "VKOSPI 섞기" and _vr["VaR 검정"] == _vr["[vkospi] VaR 검정"]
+    assert _vr["VaR 95% 예외 비율"] == _vr["[vkospi] VaR 95% 예외"] and _vr["VaR 99% 예외 비율"] == _vr["[vkospi] VaR 99% 예외"]
     # 사전 등록 규칙: 분위수 손실 비율 중앙값 < 1 이고 VaR·ES 통과 수가 줄지 않을 때만 FHS
     _mk = lambda ratio, vt_, vf, et, ef: {"[t] VaR 검정": vt_, "[fhs] VaR 검정": vf, "[t] ES 검정": et, "[fhs] ES 검정": ef,
                                           "분위수 손실 비율 (FHS ÷ t)": ratio}
@@ -1224,6 +1238,8 @@ try:
         assert "## 하루 VaR 꼬리 분포 비교" in _md and "판정:" in _md and "앞 절반" in _md
         assert "## 하루 VaR σ 보정" in _md and ("**C2 채택**" in _md or "**C2 미채택**" in _md)
         assert "## 최근 1년(이례적 급등락 구간)을 뺀 결과" in _md
+        assert _rows[0]["VaR σ 보정"] == "없음" and _rows[0]["VaR 검정"] == _rows[0]["[t] VaR 검정"]   # 대상이 아니면 본 표 = 기본(t)
+        assert _rows[0]["VaR 95% 예외 비율"] == _rows[0]["[t] VaR 95% 예외"]
         _sv = pd.read_csv(Path(_vd) / "summary.csv")
         assert len(_sv) == 2 and pd.isna(_sv.loc[0, "오류"]) and "주가 데이터 없음" in _sv.loc[1, "오류"]
 finally:

@@ -278,6 +278,9 @@ VOL_MODELS = {"auto": "자동 (AIC로 고름)", "garch": "GARCH (대칭)", "gjr"
 # 하루 VaR·ES와 시뮬레이션의 충격(꼬리) 분포. 바꾸는 규칙은 EXPERIMENTS.md에 사전 등록 (35종목 실제 데이터 비교로 판정)
 VAR_INNOVS = {"t": "t분포 (대칭, 모수 추정)", "fhs": "실제 잔차 분포 (FHS)"}
 VAR_INNOV = "t"
+# 하루 VaR σ 보정 (EXPERIMENTS.md 2026-10-29 사전 등록 규칙으로 판정): 코스피 200을 따르는 종목은 GARCH 분산과 전날 종가의
+# VKOSPI 분산을 반반 섞는다 (iv_blend_factor). 모든 종목의 크기 재보정(recal_factor)은 규칙을 통과하지 못해 쓰지 않는다.
+VAR_IV_TICKERS = ("^KS11", "069500.KS")
 
 
 def fit_vol_model(returns, model="auto", dist="t"):
