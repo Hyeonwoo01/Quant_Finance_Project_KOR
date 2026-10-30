@@ -883,11 +883,13 @@ ad.news_sentiment = lambda t, max_items=60: pd.DataFrame({"time": pd.to_datetime
                                                           "score": [1.0, -0.5, 0.25]})
 try:
     _path = Path(tempfile.mkdtemp()) / "log.csv"
-    _new, _fail = fl.record(_path, ["SPY"])
+    _at = lambda i: _full.index[i] + pd.Timedelta(hours=21)          # 그날 미국 장 마감 뒤 (UTC 21시 = 뉴욕 오후 4~5시)
+    _new, _fail = fl.record(_path, ["SPY"], now=_at(1099))
     assert len(_new) == 1 and not _fail and _new[0]["asof"] == _full.index[1099].date().isoformat()
-    assert fl.record(_path, ["SPY"])[0] == []                       # 같은 날 다시 돌려도 기록이 늘지 않음 (덮어쓰지 않음)
+    assert fl.record(_path, ["SPY"], now=_at(1099))[0] == []        # 같은 날 다시 돌려도 기록이 늘지 않음 (덮어쓰지 않음)
     _cut["n"] = 1101
-    assert len(fl.record(_path, ["SPY"])[0]) == 1 and len(fl.read_log(_path)) == 2
+    assert fl.record(_path, ["SPY"], now=_at(1101))[0] == []        # 시세가 하루 늦어 마지막 날 다음 장이 이미 열렸으면 적지 않음
+    assert len(fl.record(_path, ["SPY"], now=_at(1100))[0]) == 1 and len(fl.read_log(_path)) == 2
     _row = fl.read_log(_path).iloc[0]
     _p = fl.predict("SPY")                                           # 기록 = 같은 데이터로 다시 계산한 예측 (재현 가능)
     _cut["n"] = 1100
@@ -922,6 +924,11 @@ finally:
         setattr(md, _k, _v)
     for _k, _v in _orig_alt.items():
         setattr(ad, _k, _v)
+# 마지막 종가일 다음 장이 이미 열린 뒤에 적는 기록은 소급 기록 (한국 9:00, 미국 9:30, 공휴일은 모르므로 다음 평일)
+assert fl.is_late("2026-10-28", "005930.KS", "2026-10-29T15:10Z") and not fl.is_late("2026-10-29", "005930.KS", "2026-10-29T15:10Z")
+assert not fl.is_late("2026-10-29", "^KS11", "2026-10-29T23:59Z") and fl.is_late("2026-10-29", "^KS11", "2026-10-30T00:00Z")   # 한국 9:00
+assert not fl.is_late("2026-10-23", "005930.KS", "2026-10-25T12:00Z") and fl.is_late("2026-10-23", "005930.KS", "2026-10-26T00:00Z")  # 금 → 월
+assert not fl.is_late("2026-10-22", "SPY", "2026-10-23T13:29Z") and fl.is_late("2026-10-22", "SPY", "2026-10-23T13:30Z")       # 뉴욕 9:30
 # 끝나지 않은 오늘 봉은 기록에 쓰지 않는다 (한국 15:30·미국 16:00 마감 + 여유)
 from datetime import datetime, timezone
 _kd = pd.Series([1.0, 2.0], index=pd.to_datetime(["2026-10-22", "2026-10-23"]))
@@ -956,6 +963,10 @@ _lg = pd.DataFrame({"asof": _ci[[0, 1, 2, 70]], "ticker": "X", "close": _cl.valu
 _sc = fl.score(_lg, _cl)
 _up = (_cl.values[[21, 22, 23]] > _cl.values[[0, 1, 2]]).astype(float)
 assert _sc["summary"]["채점 수"] == 3 and np.isclose(_sc["summary"]["적중률"], np.mean((np.array([0.9, 0.1, 0.6]) > 0.5) == _up))
+# 다음 장이 열린 뒤에 적힌 기록(두 번째: 그다음 날 저녁에 적음)은 채점하지 않고 센다
+_lgl = _lg.assign(ticker="005930.KS", logged_at=[(_ci[i] + pd.Timedelta(hours=9)).strftime("%Y-%m-%dT%H:%MZ") for i in (0, 2, 2, 70)])
+_scl = fl.score(_lgl, _cl)["summary"]
+assert _scl["늦게 적어 뺀 기록"] == 1 and _scl["기록 수"] == 3 and _scl["채점 수"] == 2 and _sc["summary"]["늦게 적어 뺀 기록"] == 0
 _bs, _bb = (np.array([0.9, 0.1, 0.6]) - _up) ** 2, (0.55 - _up) ** 2
 assert np.isclose(_sc["summary"]["확률 정확도 개선"], 1 - _bs.mean() / _bb.mean())
 assert np.isclose(_sc["rows"]["ret_h"].iloc[0], _cl.iloc[21] / _cl.iloc[0] - 1)            # 기록한 종가가 아니라 비율로 채점

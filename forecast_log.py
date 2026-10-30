@@ -57,6 +57,25 @@ def drop_unfinished(close, ticker, now=None):
     return close
 
 
+# 거래소별 (시간대, 장 시작 시각 분)
+_OPENS = {"KR": ("Asia/Seoul", 9 * 60), "US": ("America/New_York", 9 * 60 + 30)}
+
+
+def next_open(asof, ticker):
+    """asof(예측에 쓴 마지막 종가일) 다음 거래일의 장 시작 시각 (UTC). 공휴일은 모르므로 다음 평일로 본다
+    (공휴일 앞이면 실제보다 이르게 잡혀 보수적)."""
+    tz, minutes = _OPENS["US" if md.is_us_ticker(ticker) else "KR"]
+    day = pd.Timestamp(asof).normalize().tz_localize(None) + pd.offsets.BDay(1)
+    return (day + pd.Timedelta(minutes=minutes)).tz_localize(tz).tz_convert("UTC")
+
+
+def is_late(asof, ticker, when):
+    """when(기록 시각)에 asof 다음 장이 이미 열렸나. 그러면 다음 날 결과를 알 수 있는 때에 적은 예측이라
+    실전 기록으로 쓰지 않는다 (소급 기록 금지 — 예약 실행이 늦거나 데이터가 하루 늦게 온 날)."""
+    when = pd.Timestamp(when)
+    return (when.tz_localize("UTC") if when.tzinfo is None else when.tz_convert("UTC")) >= next_open(asof, ticker)
+
+
 def tickers(path=TICKERS_PATH):
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     return [s.split("#")[0].strip() for s in lines if s.split("#")[0].strip()]
@@ -193,8 +212,9 @@ def _predict_retry(ticker, tries=3, wait=30, have=frozenset()):
     return None
 
 
-def record(path=LOG_PATH, names=None):
-    """오늘 예측을 기록에 추가 (같은 날짜·종목이 이미 있으면 건너뜀 — 먼저 적은 예측을 고치지 않는다)."""
+def record(path=LOG_PATH, names=None, now=None):
+    """오늘 예측을 기록에 추가 (같은 날짜·종목이 이미 있으면 건너뜀 — 먼저 적은 예측을 고치지 않는다).
+    받은 시세가 하루 늦어(Yahoo가 마지막 일봉을 빼고 줌 등) 그 다음 장이 이미 열렸으면 적지 않는다. now: 기록 시각 (테스트용)."""
     log = read_log(path)
     have = set(zip(pd.to_datetime(log["asof"]).dt.strftime("%Y-%m-%d"), log["ticker"])) if len(log) else set()
     new, failed = [], []
@@ -204,6 +224,8 @@ def record(path=LOG_PATH, names=None):
             failed.append(t)
         elif row.get("skip"):
             print(f"{t}: {row['asof']} 기록이 이미 있음 (휴장일 등) — 건너뜀", flush=True)
+        elif is_late(row["asof"], t, now or datetime.now(timezone.utc)):
+            print(f"{t}: 받은 시세의 마지막 날 {row['asof']} 다음 장이 이미 열림 (시세가 늦음) — 소급 기록이라 적지 않음", flush=True)
         else:
             new.append(row)
             print(f"{t}: {row['asof']} 상승 확률 {row['p_up']:.1%} ({row['model']}), GARCH {row['vol_garch']:.1%}", flush=True)
@@ -222,6 +244,9 @@ def score(log, close):
     반환: dict(rows = 기록별 채점 표, summary = 지표). 아직 결과가 안 나온 기록은 채점에서 빠진다.
     """
     log = log.sort_values("asof")
+    late = (log.apply(lambda r: isinstance(r["logged_at"], str) and is_late(r["asof"], r["ticker"], r["logged_at"]), axis=1)
+            if len(log) and {"logged_at", "ticker"} <= set(log) else pd.Series(False, index=log.index))
+    log = log[~late.astype(bool)]                       # 다음 장이 열린 뒤 적은 기록은 채점하지 않음 (소급 기록)
     px, idx = close.values, close.index
     lr = np.diff(np.log(px))
     rows = []
@@ -246,7 +271,7 @@ def score(log, close):
             out.update(ret_next=px[i + 1 + h] / px[i + 1] - 1, rv_next=np.sqrt(np.mean(lr[i + 1:i + 1 + h] ** 2) * 252))
         rows.append(out)
     rows = pd.DataFrame(rows)
-    s = {"기록 수": len(log), "첫 기록일": log["asof"].min(), "마지막 기록일": log["asof"].max()}
+    s = {"기록 수": len(log), "첫 기록일": log["asof"].min(), "마지막 기록일": log["asof"].max(), "늦게 적어 뺀 기록": int(late.sum())}
     if rows.empty:
         return {"rows": rows, "summary": s}
     if "exc95" in rows:

@@ -1120,8 +1120,11 @@ with tab4:
         fsc = fl.score(mine, close_long if p_up is not None else close)
         fs = fsc["summary"]
         n_done = fs.get("채점 수", 0)
-        st.caption(f"기록 {fs['기록 수']}일 ({fs['첫 기록일'].date()} ~ {fs['마지막 기록일'].date()}), 21거래일 결과가 나온 기록 {n_done}개. "
-                   "예측은 앱 기본 설정(방향 21거래일, GARCH 학습 3년)으로 계산했습니다.")
+        late_note = (f" 다음 장이 열린 뒤에 적힌 기록 {fs['늦게 적어 뺀 기록']}개는 소급 기록이라 채점에서 뺐습니다 "
+                     "(예약 실행이 늦었거나 시세가 하루 늦게 온 날)." if fs.get("늦게 적어 뺀 기록") else "")
+        span = f" ({fs['첫 기록일'].date()} ~ {fs['마지막 기록일'].date()})" if fs["기록 수"] else ""
+        st.caption(f"기록 {fs['기록 수']}일{span}, 21거래일 결과가 나온 기록 {n_done}개. "
+                   "예측은 앱 기본 설정(방향 21거래일, GARCH 학습 3년)으로 계산했습니다." + late_note)
         if n_done:
             f1, f2, f3, f4 = st.columns(4)
             f1.metric("방향 적중률", f"{fs['적중률']:.0%}", f"기본 확률 {fs['기본 확률 적중률']:.0%}", delta_color="off")
