@@ -57,23 +57,24 @@ def drop_unfinished(close, ticker, now=None):
     return close
 
 
-# 거래소별 (시간대, 장 시작 시각 분)
-_OPENS = {"KR": ("Asia/Seoul", 9 * 60), "US": ("America/New_York", 9 * 60 + 30)}
+# 거래소별 (시간대, 장 시작 분, 장 마감 분)
+_HOURS = {"KR": ("Asia/Seoul", 9 * 60, 15 * 60 + 30), "US": ("America/New_York", 9 * 60 + 30, 16 * 60)}
 
 
-def next_open(asof, ticker):
-    """asof(예측에 쓴 마지막 종가일) 다음 거래일의 장 시작 시각 (UTC). 공휴일은 모르므로 다음 평일로 본다
-    (공휴일 앞이면 실제보다 이르게 잡혀 보수적)."""
-    tz, minutes = _OPENS["US" if md.is_us_ticker(ticker) else "KR"]
+def next_session(asof, ticker, at="open"):
+    """asof(예측에 쓴 마지막 종가일) 다음 거래일의 장 시작(at="open") 또는 마감(at="close") 시각 (UTC).
+    공휴일은 모르므로 다음 평일로 본다 (공휴일 앞이면 실제보다 이르게 잡혀 보수적)."""
+    tz, op, cl = _HOURS["US" if md.is_us_ticker(ticker) else "KR"]
     day = pd.Timestamp(asof).normalize().tz_localize(None) + pd.offsets.BDay(1)
-    return (day + pd.Timedelta(minutes=minutes)).tz_localize(tz).tz_convert("UTC")
+    return (day + pd.Timedelta(minutes=op if at == "open" else cl)).tz_localize(tz).tz_convert("UTC")
 
 
-def is_late(asof, ticker, when):
-    """when(기록 시각)에 asof 다음 장이 이미 열렸나. 그러면 다음 날 결과를 알 수 있는 때에 적은 예측이라
-    실전 기록으로 쓰지 않는다 (소급 기록 금지 — 예약 실행이 늦거나 데이터가 하루 늦게 온 날)."""
+def is_late(asof, ticker, when, at="open"):
+    """when(기록 시각)이 asof 다음 거래일의 장 시작(at="open") 또는 마감(at="close") 뒤인가.
+    장 시작 뒤: 다음 날 결과를 알 수 있는 때에 적은 기록 → 새로 적지 않는다 (소급 기록 금지).
+    장 마감 뒤: 심리 지표가 그 종가 뒤의 뉴스까지 담고 있어, 그 종가부터 재는 심리 지표 채점에 쓰지 않는다."""
     when = pd.Timestamp(when)
-    return (when.tz_localize("UTC") if when.tzinfo is None else when.tz_convert("UTC")) >= next_open(asof, ticker)
+    return (when.tz_localize("UTC") if when.tzinfo is None else when.tz_convert("UTC")) >= next_session(asof, ticker, at)
 
 
 def tickers(path=TICKERS_PATH):
@@ -244,19 +245,24 @@ def score(log, close):
     반환: dict(rows = 기록별 채점 표, summary = 지표). 아직 결과가 안 나온 기록은 채점에서 빠진다.
     """
     log = log.sort_values("asof")
-    late = (log.apply(lambda r: isinstance(r["logged_at"], str) and is_late(r["asof"], r["ticker"], r["logged_at"]), axis=1)
-            if len(log) and {"logged_at", "ticker"} <= set(log) else pd.Series(False, index=log.index))
-    log = log[~late.astype(bool)]                       # 다음 장이 열린 뒤 적은 기록은 채점하지 않음 (소급 기록)
+    # 늦게 적힌 기록: 예측은 기록 날짜까지의 데이터로만 계산돼(data_fp) 방향·범위·변동성·VaR 채점에는 그대로 쓴다.
+    # 다만 다음 거래일 장 마감 뒤에 적힌 기록은 심리 지표가 그 종가 뒤의 뉴스까지 담고 있어 심리 지표 채점에서만 뺀다.
+    def flag(at):
+        if not len(log) or not {"logged_at", "ticker"} <= set(log):
+            return pd.Series(False, index=log.index)
+        return log.apply(lambda r: isinstance(r["logged_at"], str) and is_late(r["asof"], r["ticker"], r["logged_at"], at),
+                         axis=1).astype(bool)
+    late_open, late_close = flag("open"), flag("close")
     px, idx = close.values, close.index
     lr = np.diff(np.log(px))
     rows = []
-    for _, r in log.iterrows():
+    for k, r in log.iterrows():
         i = idx.searchsorted(r["asof"], side="right") - 1          # 기록한 날(또는 그 직전 거래일)
         if i < 0:
             continue
         h = int(r["h"])
         out = {"asof": r["asof"], "p_up": r["p_up"], "p_base": r["p_base"], "model": r["model"], "p_high": r["p_high"],
-               **{c: r.get(c, np.nan) for c in SENTIMENT}}
+               **{c: np.nan if late_close[k] else r.get(c, np.nan) for c in SENTIMENT}}
         if i + 1 < len(px):
             r1 = px[i + 1] / px[i] - 1
             out.update(ret_1d=r1, exc95=float(r1 < -r["var95_1d"]), exc99=float(r1 < -r["var99_1d"]))
@@ -271,7 +277,8 @@ def score(log, close):
             out.update(ret_next=px[i + 1 + h] / px[i + 1] - 1, rv_next=np.sqrt(np.mean(lr[i + 1:i + 1 + h] ** 2) * 252))
         rows.append(out)
     rows = pd.DataFrame(rows)
-    s = {"기록 수": len(log), "첫 기록일": log["asof"].min(), "마지막 기록일": log["asof"].max(), "늦게 적어 뺀 기록": int(late.sum())}
+    s = {"기록 수": len(log), "첫 기록일": log["asof"].min(), "마지막 기록일": log["asof"].max(), "늦게 적힌 기록": int(late_open.sum()),
+         "심리 지표에서 뺀 기록": int(late_close.sum())}
     if rows.empty:
         return {"rows": rows, "summary": s}
     if "exc95" in rows:
