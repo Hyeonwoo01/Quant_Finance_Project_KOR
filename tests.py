@@ -604,6 +604,24 @@ assert np.isclose(range_level_now(_ohlc, _ohlc.index[:900]), ewma_level(_rv.iloc
 _oh3 = _ohlc.copy()
 _oh3.iloc[-300:, 1] = _oh3.iloc[-300:, 2]                                         # 최근 300일 고가 = 저가 → 유효 60%
 assert np.isnan(range_level_now(_oh3, _oh3.index)) and np.isfinite(range_level_now(_oh3, _oh3.index, min_valid=0.5))
+# Yahoo가 잠깐 빈 일봉을 주면 다시 받음 (세 번째에 받으면 그 표, 끝까지 비면 오류)
+_yt0, _ohc = md.yf.Ticker, {"n": 0}
+class _FakeT:
+    def __init__(self, t): pass
+    def history(self, period, auto_adjust):
+        _ohc["n"] += 1
+        return _ohlc.tz_localize("Asia/Seoul") if _ohc["n"] >= 3 else pd.DataFrame()
+md.yf.Ticker = _FakeT
+try:
+    assert md.load_ohlc("005930.KS", 3, wait=0).equals(_ohlc) and _ohc["n"] == 3
+    _ohc["n"] = -10
+    try:
+        md.load_ohlc("005930.KS", 3, wait=0)
+        raise AssertionError("빈 일봉인데 오류가 아님")
+    except ValueError:
+        pass
+finally:
+    md.yf.Ticker = _yt0
 # 하루 VaR 배수: 코스피 200 종목은 VKOSPI, 나머지는 장중 실현 분산. 다른 쪽 값은 쓰지 않음
 assert np.isclose(day1_var_factor(0.01, True, 100 * 0.02 * np.sqrt(252), 1e-4), np.sqrt(2.5))
 assert np.isclose(day1_var_factor(0.01, False, 100 * 0.02 * np.sqrt(252), 4e-4), np.sqrt(2.5))
@@ -895,7 +913,7 @@ try:
     _cut["n"] = 1100
     assert np.isclose(fl.predict("SPY")["p_up"], _row["p_up"]) and np.isclose(fl.predict("SPY")["lo68"], _row["lo68"])
     assert _row["lo95"] < _row["lo68"] < _row["close"] < _row["hi68"] < _row["hi95"] and 0 < _row["var95_1d"] < _row["var99_1d"]
-    # 코스피 200 종목의 하루 VaR: GARCH와 그날 VKOSPI를 반반 섞은 σ → 하루 로그수익률 분위수가 같은 배수로 커짐 (21일 범위는 그대로)
+    # 코스피 200 종목의 하루 VaR: GARCH와 전전 거래일 VKOSPI를(KRX가 하루 늦게 줌) 반반 섞은 σ → 하루 로그수익률 분위수가 같은 배수로 커짐 (21일 범위는 그대로)
     _base = fl.predict("SPY")
     assert np.isnan(_base["var_vkospi"])                              # 대상 종목이 아니면 VKOSPI는 섞지 않음
     # 그 밖의 종목: 장중 고가·저가 실현 분산을 반반 섞음 (일봉을 못 받으면 GARCH 그대로) → 하루 분위수만 같은 배수로 바뀜
@@ -909,7 +927,7 @@ try:
     _f95, _f99 = (np.log1p(-_base[k]) / np.log1p(-_g0[k]) for k in ("var95_1d", "var99_1d"))
     assert np.isnan(_g0["var_range_vol"]) and _f95 > 1.05 and np.isclose(_f95, _f99, rtol=1e-6) and np.isclose(_base["lo68"], _g0["lo68"])
     _ivt0, _vko0 = fl.VAR_IV_TICKERS, kr_data.vkospi_on
-    fl.VAR_IV_TICKERS, kr_data.vkospi_on = ("SPY",), lambda d: 40.0
+    fl.VAR_IV_TICKERS, kr_data.vkospi_on = ("SPY",), lambda d: 40.0 if d == _full.index[1098] else np.nan   # 마지막 종가일의 전 거래일 값만
     try:
         _bl = fl.predict("SPY")
     finally:
@@ -1269,9 +1287,9 @@ try:
     assert len(_vr["_obs"]) > 0 and (_vr["_obs"]["c"] >= 2 * vd.COST_BPS * 1e-4).all()      # 비용 = 수수료 양쪽 + 세금
     assert _vr["ES 검정"] in ("통과", "기각") and _vr["VaR 검증 일수"] > 500 and _vr["GARCH 진단"].count("수렴") == 1
     assert _vr["분위수 손실 비율 (FHS ÷ t)"] > 0
-    # VKOSPI 섞기 대상 종목은 본 표가 섞은 VaR (2026-10-29 판정), 아니면 기본(t) 그대로
-    assert _vr["VaR σ 보정"] == "VKOSPI 섞기" and _vr["VaR 검정"] == _vr["[vkospi] VaR 검정"]
-    assert _vr["VaR 95% 예외 비율"] == _vr["[vkospi] VaR 95% 예외"] and _vr["VaR 99% 예외 비율"] == _vr["[vkospi] VaR 99% 예외"]
+    # VKOSPI 섞기 대상 종목은 본 표가 실전에서 받을 수 있는 전전 거래일 VKOSPI를 섞은 VaR (C1L2, 2026-10-30 판정)
+    assert _vr["VaR σ 보정"] == "VKOSPI 섞기" and _vr["VaR 검정"] == _vr["[vkospi2] VaR 검정"]
+    assert _vr["VaR 95% 예외 비율"] == _vr["[vkospi2] VaR 95% 예외"] and _vr["VaR 99% 예외 비율"] == _vr["[vkospi2] VaR 99% 예외"]
     # 예외 몰림 후보 K2는 지금 기본(이 종목은 VKOSPI 섞기)과 비교
     assert _vr["[cur] VaR 검정"] == _vr["VaR 검정"] and _vr["[k2] VaR 검정"] in ("통과", "기각")
     assert all(np.isfinite(_vr[f"분위수 손실 비율 (k2 ÷ 현재){_p}"]) for _p in ("", " 앞 절반", " 뒤 절반"))

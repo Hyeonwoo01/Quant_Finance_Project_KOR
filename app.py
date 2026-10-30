@@ -347,10 +347,11 @@ garch = fit_vol_model(rets.values, vol_model)
 rv_h = garch.forecast_vol(horizon)
 
 sims = garch.simulate(horizon)                                      # (경로, 일) 누적 로그수익률 — 요약 카드와 1번 탭에서 같이 씀
-# 하루 VaR σ 보정 (EXPERIMENTS.md 2026-10-29 판정): 코스피 200을 따르는 종목은 GARCH와 마지막 종가일의 VKOSPI를,
+# 하루 VaR σ 보정 (EXPERIMENTS.md 판정): 코스피 200을 따르는 종목은 GARCH와 마지막 종가일의 전 거래일 VKOSPI를 (C1L2, 2026-10-30),
 # 나머지는 GARCH와 장중 고가·저가로 잰 최근 실현 분산을 반반 섞는다
 use_iv = ticker in VAR_IV_TICKERS
-vk_last = get_vkospi(close.index[-1]) if use_iv else np.nan
+vk_day = close.index[-2] if len(close) > 1 else close.index[-1]       # 전전 거래일 (KRX는 그날 값을 다음 영업일 아침에 줌, C1L2)
+vk_last = get_vkospi(vk_day) if use_iv else np.nan
 rl_last = np.nan if use_iv else get_range_level(ticker, years, close.index[-1])
 day1 = day1_var_factor(np.sqrt(garch.sigma2_next), use_iv, vk_last, rl_last) * sims[:, 0]
 kind = get_tax_kind(ticker)
@@ -450,7 +451,7 @@ with tab1:
     st.caption(f"VaR 95%는 '100번 중 95번은 손실이 이보다 작다'는 뜻입니다. 예를 들어 1,000만 원어치를 들고 있다면 "
                f"하루에 약 {risk['1d95'][0] * 1e7:,.0f}원 넘게 잃을 확률이 5%입니다. ES는 그 나머지 최악 5% 경우의 평균 손실입니다. "
                f"큰 값은 t분포 {garch.name}(꼬리 두께 ν = {garch.nu:.1f}) 시뮬레이션, '과거 실제'는 학습 기간({years}년)의 실제 수익률로 계산했습니다."
-               + ((f" 하루 VaR는 GARCH 변동성과 VKOSPI({close.index[-1].date()} 종가 {vk_last:.1f})를 반반 섞은 변동성으로 계산합니다 — "
+               + ((f" 하루 VaR는 GARCH 변동성과 VKOSPI({vk_day.date()} 종가 {vk_last:.1f}, KRX가 하루 늦게 주는 값)를 반반 섞은 변동성으로 계산합니다 — "
                    "GARCH만으로는 이 지수의 하루 손실 위험을 꾸준히 작게 잡아, 미리 정한 규칙으로 검증해 바꿨습니다 (EXPERIMENTS.md)."
                    if np.isfinite(vk_last) else
                    " VKOSPI를 받지 못해 하루 VaR는 GARCH만으로 계산했습니다 (이 지수는 GARCH만으로 위험을 작게 잡는 경향이 있습니다).")

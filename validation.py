@@ -206,10 +206,11 @@ def validate(ticker):
         row[f"분위수 손실 비율 ({m} ÷ 기본)"] = _ql(d) / _ql(vd)
         for (part, dp), (_, bp) in zip(_halves(d), _halves(vd)):
             row[f"분위수 손실 비율 ({m} ÷ 기본) {part}"] = _ql(dp) / _ql(bp)
-    # 채택된 보정 (2026-10-29 판정): 코스피 200 종목의 본 표는 VKOSPI를 섞은 VaR. 비교 열([t]·[recal]·[vkospi])은 위에서 이미 기록
-    row["VaR σ 보정"] = "VKOSPI 섞기" if ticker in VKOSPI_TICKERS and "vkospi" in factors else "없음"
+    # 채택된 보정: 코스피 200 종목의 본 표는 실전에서 받을 수 있는 전전 거래일 VKOSPI를 섞은 VaR (C1L2, 2026-10-30 판정).
+    # 비교 열([t]·[recal]·[vkospi]·[vkospi2])은 위에서 이미 기록
+    row["VaR σ 보정"] = "VKOSPI 섞기" if ticker in VKOSPI_TICKERS and "vkospi2" in factors else "없음"
     if row["VaR σ 보정"] != "없음":
-        vt, vd = var_rescale(vt, vd, factors["vkospi"])
+        vt, vd = var_rescale(vt, vd, factors["vkospi2"])
     vdays = rd.index[vstart:]
     brk = after_break(vdays, rd.index[vstart - 1])
 
@@ -556,8 +557,8 @@ def report_markdown(rows, rank=None, when="", version="", buckets=None):
     lines += ["", "## 하루 VaR·ES 검정 (첫 3년 학습 뒤 전체 기간)", "",
               "예외 = 실제 손실이 VaR보다 컸던 날. 손실 비율 = 예외일의 실제 손실 ÷ 예측 ES (1에 가까워야 하고, 크면 꼬리 손실을 작게 잡은 것). "
               "앞·뒤 절반 = 검증 기간을 반으로 나눈 95% 예외 비율 (시기에 따라 흔들리는지). "
-              "앱·기록과 같이 코스피 지수·KODEX 200은 GARCH와 전날 VKOSPI를 반반 섞은 σ(이름 옆 *), 나머지 종목은 GARCH와 "
-              "장중 고가·저가로 잰 최근 실현 분산을 반반 섞은 σ(이름 옆 †)로 계산합니다 (2026-10-29 판정).", "",
+              "앱·기록과 같이 코스피 지수·KODEX 200은 GARCH와 전전 거래일 VKOSPI(실전에서 받을 수 있는 값)를 반반 섞은 σ(이름 옆 *), 나머지 종목은 GARCH와 "
+              "장중 고가·저가로 잰 최근 실현 분산을 반반 섞은 σ(이름 옆 †)로 계산합니다 (2026-10-29·30 판정).", "",
               "| 종목 | 검증 일수 | 95% 예외 (목표 5%) | p값 | 99% 예외 (목표 1%) | p값 | VaR 결과 | ES 손실 비율 95% · 99% | ES p값 95% · 99% | ES 결과 | 95% 예외 앞·뒤 절반 |",
               "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in ok:
