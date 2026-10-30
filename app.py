@@ -1121,8 +1121,10 @@ with tab4:
         fsc = fl.score(mine, close_long if p_up is not None else close)
         fs = fsc["summary"]
         n_done = fs.get("채점 수", 0)
-        late_note = (f" 다음 장이 열린 뒤에 적힌 기록 {fs['늦게 적어 뺀 기록']}개는 소급 기록이라 채점에서 뺐습니다 "
-                     "(예약 실행이 늦었거나 시세가 하루 늦게 온 날)." if fs.get("늦게 적어 뺀 기록") else "")
+        late_note = (f" 예약 실행이 늦거나 시세가 하루 늦게 와서 다음 장이 열린 뒤에 적힌 기록이 {fs['늦게 적힌 기록']}개 있습니다. "
+                     "예측은 기록 날짜까지의 데이터로만 계산돼 채점에 쓰고, 그중 다음 거래일 장 마감 뒤에 적힌 "
+                     f"{fs['심리 지표에서 뺀 기록']}개는 그 뒤의 뉴스가 섞여 시장 심리 지표 채점에서만 뺐습니다."
+                     if fs.get("늦게 적힌 기록") else "")
         span = f" ({fs['첫 기록일'].date()} ~ {fs['마지막 기록일'].date()})" if fs["기록 수"] else ""
         st.caption(f"기록 {fs['기록 수']}일{span}, 21거래일 결과가 나온 기록 {n_done}개. "
                    "예측은 앱 기본 설정(방향 21거래일, GARCH 학습 3년)으로 계산했습니다." + late_note)

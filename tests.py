@@ -947,6 +947,9 @@ assert fl.is_late("2026-10-28", "005930.KS", "2026-10-29T15:10Z") and not fl.is_
 assert not fl.is_late("2026-10-29", "^KS11", "2026-10-29T23:59Z") and fl.is_late("2026-10-29", "^KS11", "2026-10-30T00:00Z")   # 한국 9:00
 assert not fl.is_late("2026-10-23", "005930.KS", "2026-10-25T12:00Z") and fl.is_late("2026-10-23", "005930.KS", "2026-10-26T00:00Z")  # 금 → 월
 assert not fl.is_late("2026-10-22", "SPY", "2026-10-23T13:29Z") and fl.is_late("2026-10-22", "SPY", "2026-10-23T13:30Z")       # 뉴욕 9:30
+# 다음 거래일 장 마감(한국 15:30) 기준: 10-22 기록을 10-23 오전에 적었으면 마감 전, 10-28 기록을 10-30 자정 넘어 적었으면 마감 뒤
+assert not fl.is_late("2026-10-22", "005930.KS", "2026-10-23T02:33Z", "close") and fl.is_late("2026-10-22", "005930.KS", "2026-10-23T02:33Z")
+assert fl.is_late("2026-10-28", "005930.KS", "2026-10-29T15:10Z", "close") and not fl.is_late("2026-10-28", "005930.KS", "2026-10-29T06:29Z", "close")
 # 끝나지 않은 오늘 봉은 기록에 쓰지 않는다 (한국 15:30·미국 16:00 마감 + 여유)
 from datetime import datetime, timezone
 _kd = pd.Series([1.0, 2.0], index=pd.to_datetime(["2026-10-22", "2026-10-23"]))
@@ -981,10 +984,14 @@ _lg = pd.DataFrame({"asof": _ci[[0, 1, 2, 70]], "ticker": "X", "close": _cl.valu
 _sc = fl.score(_lg, _cl)
 _up = (_cl.values[[21, 22, 23]] > _cl.values[[0, 1, 2]]).astype(float)
 assert _sc["summary"]["채점 수"] == 3 and np.isclose(_sc["summary"]["적중률"], np.mean((np.array([0.9, 0.1, 0.6]) > 0.5) == _up))
-# 다음 장이 열린 뒤에 적힌 기록(두 번째: 그다음 날 저녁에 적음)은 채점하지 않고 센다
-_lgl = _lg.assign(ticker="005930.KS", logged_at=[(_ci[i] + pd.Timedelta(hours=9)).strftime("%Y-%m-%dT%H:%MZ") for i in (0, 2, 2, 70)])
-_scl = fl.score(_lgl, _cl)["summary"]
-assert _scl["늦게 적어 뺀 기록"] == 1 and _scl["기록 수"] == 3 and _scl["채점 수"] == 2 and _sc["summary"]["늦게 적어 뺀 기록"] == 0
+# 늦게 적힌 기록도 방향·범위·VaR 채점에는 쓰고(예측은 기록 날짜까지의 데이터), 다음 거래일 장 마감 뒤에 적힌 것만 심리 지표에서 뺀다
+# 두 번째: 그다음 날 저녁 6시에 적음(마감 뒤), 세 번째: 그다음 날 오전 10시에 적음(장 시작 뒤·마감 전)
+_lgl = _lg.assign(ticker="005930.KS", news_7d=[0.1, 0.2, 0.3, 0.4],
+                  logged_at=[(_ci[i] + pd.Timedelta(hours=hr)).strftime("%Y-%m-%dT%H:%MZ") for i, hr in ((0, 9), (2, 9), (3, 1), (70, 9))])
+_scl = fl.score(_lgl, _cl)
+assert _scl["summary"]["늦게 적힌 기록"] == 2 and _scl["summary"]["심리 지표에서 뺀 기록"] == 1 and _scl["summary"]["채점 수"] == 3
+assert _scl["rows"]["news_7d"].isna().tolist() == [False, True, False, False] and _sc["summary"]["늦게 적힌 기록"] == 0
+assert np.isclose(_scl["summary"]["적중률"], _sc["summary"]["적중률"])
 _bs, _bb = (np.array([0.9, 0.1, 0.6]) - _up) ** 2, (0.55 - _up) ** 2
 assert np.isclose(_sc["summary"]["확률 정확도 개선"], 1 - _bs.mean() / _bb.mean())
 assert np.isclose(_sc["rows"]["ret_h"].iloc[0], _cl.iloc[21] / _cl.iloc[0] - 1)            # 기록한 종가가 아니라 비율로 채점
