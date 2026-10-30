@@ -1234,17 +1234,21 @@ md.load_macro = lambda t, years=10: None
 md.kr_info = lambda t: ("테스트전자", "KOSPI", "stock")
 ad.build_alt_features = lambda t, idx: (None, {})
 _vk_orig = (vd.VKOSPI_TICKERS, vd._vkospi_prev)
-vd.VKOSPI_TICKERS, vd._vkospi_prev = ("005930.KS",), lambda dates: np.full(len(dates), 25.0)   # 이 종목도 VKOSPI 섞기 대상인 척
+vd.VKOSPI_TICKERS, vd._vkospi_prev = ("005930.KS",), \
+    lambda dates, lag=1: np.full(len(dates), 25.0) if lag == 1 else np.r_[np.nan, np.nan, np.full(len(dates) - 2, 30.0)]   # 이 종목도 VKOSPI 섞기 대상인 척
 try:
     try:
         _vr = vd.validate("005930.KS")
     finally:
         vd.VKOSPI_TICKERS, vd._vkospi_prev = _vk_orig
     # σ 보정 두 후보가 같은 예측을 다시 채점: 비율·검정·배수 (VKOSPI는 검증 기간 모든 날에 값)
-    for _m in ("recal", "vkospi"):
+    for _m in ("recal", "vkospi", "vkospi2"):
         assert _vr[f"[{_m}] VaR 검정"] in ("통과", "기각") and _vr[f"[{_m}] ES 검정"] in ("통과", "기각")
         assert all(np.isfinite(_vr[f"분위수 손실 비율 ({_m} ÷ 기본){_p}"]) for _p in ("", " 앞 절반", " 뒤 절반"))
     assert _vr["[vkospi] VKOSPI 있는 날"] == f"{_vr['VaR 검증 일수']}/{_vr['VaR 검증 일수']}" and 0.8 <= _vr["[recal] 배수 중앙값"] <= 1.5
+    # C1L2: 하루 더 지난 VKOSPI (앞 두 날은 값이 없음) → C1과 다른 배수
+    assert _vr["[vkospi2] VKOSPI 있는 날"] == f"{_vr['VaR 검증 일수'] - 2}/{_vr['VaR 검증 일수']}"
+    assert _vr["[vkospi2] 배수 중앙값"] > _vr["[vkospi] 배수 중앙값"] and _vr["[vkospi2] 분위수 손실"] != _vr["[vkospi] 분위수 손실"]
     assert np.isclose(_vr["[recal] 분위수 손실"] / _vr["[t] 분위수 손실"], _vr["분위수 손실 비율 (recal ÷ 기본)"], rtol=1e-6)
     assert _vr["세금 구분"] == "KOSPI" and _vr["방향 예측력"] in ("있음", "확인 안 됨") and 0 <= _vr["가정 바꿔 통과(7개 중)"] <= 7
     assert _vr["방향 초과 95% 하한"] <= _vr["방향 초과수익(연)"] <= _vr["방향 초과 95% 상한"]
@@ -1294,6 +1298,21 @@ try:
     _o3 = vd.var_scale_rule([_ms("^KS11", _bd, c1=_gd), _ms("069500.KS", _bd, c1=_gd)])
     assert not _o3["C2 채택"] and _o3["C1 채택"] and _o3["다른 종목에 쓸 것"] == "기본 그대로"
     assert not vd.var_scale_rule([_ms("^KS11", _gd, c1=_gd)])["C1 채택"]          # 두 종목 모두 있어야
+    # C1L2 규칙 (C1과 같음): 두 종목 모두 세 구간 < 1, 두 종목의 VaR·ES 통과 수 유지. C1L2 ÷ C1은 보고만
+    def _ml(t, c, vt_="기각", vl="통과", et="통과", el="통과"):
+        r = {"종목": t, "[t] VaR 검정": vt_, "[vkospi2] VaR 검정": vl, "[t] ES 검정": et, "[vkospi2] ES 검정": el,
+             "[vkospi] 분위수 손실": 10.0, "[vkospi2] 분위수 손실": 10.2}
+        r.update({f"[{m}] VaR {lv}% 예외": x for m, x in (("t", 0.07), ("vkospi", 0.05), ("vkospi2", 0.055)) for lv in (95, 99)})
+        r.update({f"분위수 손실 비율 (vkospi2 ÷ 기본){p}": x for p, x in zip(("", " 앞 절반", " 뒤 절반"), c)})
+        return r
+    _lr = vd.var_iv_lag_rule([_ml("^KS11", _gd), _ml("069500.KS", _gd), _ml("005930.KS", _bd)])
+    assert _lr["C1L2 채택"] and _lr["대상"] == 2 and np.isclose(_lr["^KS11 C1L2 ÷ C1"], 1.02)
+    assert _lr["VaR 검정 통과 기본 → C1L2"] == (0, 2) and _lr["^KS11 VaR 95% 예외 기본 · C1 · C1L2"] == (0.07, 0.05, 0.055)
+    assert not vd.var_iv_lag_rule([_ml("^KS11", _gd), _ml("069500.KS", _bd)])["C1L2 채택"]                 # 앞 절반 1.01
+    assert not vd.var_iv_lag_rule([_ml("^KS11", _gd, vt_="통과", vl="기각"), _ml("069500.KS", _gd, vl="기각")])["C1L2 채택"]   # 두 종목 VaR 통과 1 → 0
+    assert vd.var_iv_lag_rule([_ml("^KS11", _gd, vt_="통과", vl="기각"), _ml("069500.KS", _gd)])["C1L2 채택"]       # 합이 1 → 1이면 유지
+    assert not vd.var_iv_lag_rule([_ml("^KS11", _gd)])["C1L2 채택"] and vd.var_iv_lag_rule([_ml("005930.KS", _gd)]) is None
+    assert "**C1L2 채택**" in "\n".join(vd._iv_lag_lines([_ml("^KS11", _gd), _ml("069500.KS", _gd)]))
     # 예외 몰림 K2 규칙: 코스피 200 두 종목과 나머지를 따로. 세 구간 모두 < 1, VaR·ES 통과 수 유지
     def _mk2(t, k2, vc="통과", vk="통과", ec="통과", ek="통과"):
         r = {"종목": t, "[cur] VaR 검정": vc, "[k2] VaR 검정": vk, "[cur] ES 검정": ec, "[k2] ES 검정": ek,
@@ -1319,9 +1338,11 @@ try:
     kr_data.vkospi = lambda dates, workers=4: (pd.Series(np.arange(len(dates), dtype=float), index=dates), ["코스피 200 변동성지수"])
     try:
         _pv = vd._vkospi_prev(_hist.index[:5])
+        _pv2 = vd._vkospi_prev(_hist.index[:5], lag=2)                 # C1L2: 전전 거래일 값 (실전에서 받을 수 있는 것)
     finally:
         kr_data.get_key, kr_data.vkospi = _gk0, _vk0
     assert np.isnan(_pv[0]) and np.array_equal(_pv[1:], np.arange(4.0))
+    assert np.isnan(_pv2[:2]).all() and np.array_equal(_pv2[2:], np.arange(3.0))
     # 같은 데이터로 앱 방향 예측 탭과 같은 숫자 (같은 함수·같은 기본 설정)
     _wfv, _ = dr.walk_forward(_hist, 21, None, alt=None, ticker="005930.KS")
     _evv = dr.evaluate(_wfv, 21, np.log(_hist).diff(), 3.0, lag=1, sell_tax=kc.sell_tax_rate(_hist.index, "KOSPI"))
