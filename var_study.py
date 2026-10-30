@@ -132,14 +132,14 @@ CLUSTER_TICKERS = ["^KS11", "069500.KS", "229200.KS", "005930.KS", "000660.KS", 
 
 
 def current_var(ticker, r):
-    """지금 기본 하루 VaR의 검증 구간 날짜별 표 (자동 GARCH·t분포, 코스피 200 종목은 전날 VKOSPI 섞기, 나머지는 장중 고가·저가
+    """지금 기본 하루 VaR의 검증 구간 날짜별 표 (자동 GARCH·t분포, 코스피 200 종목은 전전 거래일 VKOSPI 섞기, 나머지는 장중 고가·저가
     섞기 — validation.py와 같게). 반환: (날짜별 표, 전날 VKOSPI 또는 None)."""
     rr = r.values
     start = max(min(VAR_START, len(rr) - 500), 250)
     tab, d = var_backtest(rr, model="auto", start=start, detail=True, innov="t")
     iv = None
     if ticker in VAR_IV_TICKERS:
-        iv = _vkospi_prev(r.index[start:])
+        iv = _vkospi_prev(r.index[start:], lag=2)          # 실전에서 받을 수 있는 전전 거래일 값 (C1L2, 2026-10-30 판정)
         if iv is not None:
             tab, d = var_rescale(tab, d, iv_blend_factor(d["변동성"], iv))
     else:

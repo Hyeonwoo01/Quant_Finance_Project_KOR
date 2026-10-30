@@ -34,9 +34,19 @@ def load_history(ticker, years):
     return close
 
 
-def load_ohlc(ticker, years):
-    """Yahoo 일봉 시가·고가·저가·종가 (배당·분할 수정). 장중 고가·저가로 하루 변동성을 잴 때 쓴다 (quant_engine.range_variance)."""
-    h = yf.Ticker(ticker).history(period=f"{years}y", auto_adjust=True)
+def load_ohlc(ticker, years, tries=3, wait=2.0):
+    """Yahoo 일봉 시가·고가·저가·종가 (배당·분할 수정). 장중 고가·저가로 하루 변동성을 잴 때 쓴다 (quant_engine.range_variance).
+    Yahoo가 잠깐 빈 표를 줄 때가 있어(2026-10-30 검증에서 3종목) 2·4초 쉬며 tries번까지 다시 받는다."""
+    h = pd.DataFrame()
+    for k in range(tries):
+        try:
+            h = yf.Ticker(ticker).history(period=f"{years}y", auto_adjust=True)
+        except Exception:
+            h = pd.DataFrame()
+        if not h.empty:
+            break
+        if k + 1 < tries:
+            time.sleep(wait * 2 ** k)
     if h.empty:
         raise ValueError(f"'{ticker}'의 일봉(시가·고가·저가)을 찾을 수 없습니다.")
     h = h[["Open", "High", "Low", "Close"]].copy()

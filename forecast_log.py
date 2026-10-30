@@ -139,10 +139,10 @@ def predict(ticker, h=H, have=frozenset()):
     g = fit_vol_model(np.log(c3).diff().dropna().values, "auto")        # 앱 기본 '자동 (AIC)'과 같게
     sims = g.simulate(h)
     q = spot * np.exp(np.quantile(sims[:, -1], [0.025, 0.16, 0.84, 0.975]))
-    # 하루 VaR σ 보정 (EXPERIMENTS.md 2026-10-29 판정): 코스피 200을 따르는 종목은 GARCH와 그날 VKOSPI를, 나머지는 GARCH와
-    # 장중 고가·저가로 잰 최근 실현 분산을 반반 섞는다. 필요한 값이 없으면 GARCH 그대로
+    # 하루 VaR σ 보정 (EXPERIMENTS.md 판정): 코스피 200을 따르는 종목은 GARCH와 전전 거래일 VKOSPI를(KRX가 그날 값을 다음 영업일
+    # 아침에 주므로 C1L2, 2026-10-30), 나머지는 GARCH와 장중 고가·저가로 잰 최근 실현 분산을 반반 섞는다. 값이 없으면 GARCH 그대로
     use_iv = ticker in VAR_IV_TICKERS
-    vk = kr_data.vkospi_on(asof) if use_iv else np.nan
+    vk = kr_data.vkospi_on(close.index[-2]) if use_iv and len(close) > 1 else np.nan
     rl = np.nan
     if not use_iv:
         try:
