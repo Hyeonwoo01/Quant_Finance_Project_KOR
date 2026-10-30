@@ -39,7 +39,8 @@ BLOCK = 2 * H                          # 블록 부트스트랩 블록 길이 (�
 VAR_START = 756                        # 하루 VaR 검증 시작 위치: 첫 3년은 학습에만 쓰고 그 뒤 전체를 검증
 INDEX_NAMES = {"^KS11": "코스피 지수", "^KQ11": "코스닥 지수", "^KS200": "코스피 200 지수"}
 # 하루 VaR σ 보정 두 후보 (EXPERIMENTS.md 사전 등록 2026-10-29): 같은 GARCH 예측에 날짜별 배수만 곱해 다시 채점
-VAR_SCALES = {"recal": "크기 재보정 (C2)", "vkospi": "VKOSPI 섞기 (C1)"}
+VAR_SCALES = {"recal": "크기 재보정 (C2)", "vkospi": "VKOSPI 섞기 (C1)",
+              "vkospi2": "VKOSPI 하루 늦게 섞기 (C1L2)"}     # C1L2: 실전에서 받을 수 있는 전전날 값 (사전 등록 2026-10-30)
 VKOSPI_TICKERS = VAR_IV_TICKERS          # 코스피 200을 따르는 종목만 VKOSPI 섞기 대상 (2026-10-29 판정으로 이 종목들의 기본)
 
 
@@ -79,13 +80,14 @@ def _ql(daily):
     return sum(_quantile_loss(daily, lv) for lv in (0.95, 0.99))
 
 
-def _vkospi_prev(dates):
-    """dates(수익률 날짜)마다 그 전 거래일 종가의 VKOSPI (예측하는 날 전날 값 → 미래 정보 없음). 받지 못하면 None."""
+def _vkospi_prev(dates, lag=1):
+    """dates(수익률 날짜)마다 lag 거래일 전 종가의 VKOSPI (lag=1: 예측하는 날 전날 값 → 미래 정보 없음,
+    lag=2: 그 전 거래일 값 — KRX가 그날 값을 다음 영업일 아침에 주므로 실전에서 받을 수 있는 것). 받지 못하면 None."""
     import kr_data
     if not kr_data.get_key("KRX_API_KEY"):
         return None
     vk, _ = kr_data.vkospi(dates)
-    return vk.shift(1).to_numpy()
+    return vk.shift(lag).to_numpy()
 
 
 def _without_recent(close, wf, r, tax, days):
@@ -191,6 +193,10 @@ def validate(ticker):
             if iv is not None and np.isfinite(iv).any():
                 factors["vkospi"] = iv_blend_factor(vd["변동성"], iv)
                 row["[vkospi] VKOSPI 있는 날"] = f"{int(np.isfinite(iv).sum())}/{len(iv)}"
+                # C1L2 (사전 등록 2026-10-30): 하루 더 지난 VKOSPI — 기본(t)과 비교, 보고만으로 C1과도 비교
+                iv2 = _vkospi_prev(rd.index[vstart:], lag=2)
+                factors["vkospi2"] = iv_blend_factor(vd["변동성"], iv2)
+                row["[vkospi2] VKOSPI 있는 날"] = f"{int(np.isfinite(iv2).sum())}/{len(iv2)}"
         except Exception as e:
             row["[vkospi] 오류"] = f"{type(e).__name__}: {str(e)[:80]}"
     for m, f in factors.items():
@@ -315,6 +321,50 @@ def var_scale_rule(rows):
     res["코스피 200 종목에 쓸 것"] = VAR_SCALES[index_pick] if index_pick else "기본 그대로"
     res["다른 종목에 쓸 것"] = VAR_SCALES["recal"] if res["C2 채택"] else "기본 그대로"
     return res
+
+
+def var_iv_lag_rule(rows):
+    """C1L2(VKOSPI 하루 늦게 섞기) 사전 등록 규칙 (EXPERIMENTS.md 2026-10-30): C1 규칙과 같음 — 코스피 200 두 종목 모두
+    분위수 손실 비율(C1L2 ÷ 기본)이 전체·앞·뒤 절반에서 < 1이고 두 종목의 VaR·ES 통과 수가 기본보다 줄지 않으면 채택.
+    보고만: 분위수 손실 비율(C1L2 ÷ C1) — 하루 늦어져 잃는 정도. 반환: 판정에 쓴 숫자와 결론 (대상이 없으면 None)."""
+    parts = ("", " 앞 절반", " 뒤 절반")
+    ratio = "분위수 손실 비율 (vkospi2 ÷ 기본)"
+    idx = [r for r in rows if "오류" not in r and r["종목"] in VKOSPI_TICKERS and np.isfinite(r.get(ratio, np.nan))]
+    if not idx:
+        return None
+    passed = lambda m, k: sum(r[f"[{m}] {k}"] == "통과" for r in idx)
+    res = {"대상": len(idx)}
+    for r in idx:
+        for p in parts:
+            res[f"{r['종목']} 비율{p}"] = r[f"{ratio}{p}"]
+        res[f"{r['종목']} C1L2 ÷ C1"] = r["[vkospi2] 분위수 손실"] / r["[vkospi] 분위수 손실"]
+        for k in ("VaR 95% 예외", "VaR 99% 예외"):
+            res[f"{r['종목']} {k} 기본 · C1 · C1L2"] = tuple(r[f"[{m}] {k}"] for m in ("t", "vkospi", "vkospi2"))
+    for k in ("VaR 검정", "ES 검정"):
+        res[f"{k} 통과 기본 → C1L2"] = (passed("t", k), passed("vkospi2", k))
+    res["C1L2 채택"] = bool(len(idx) == len(VKOSPI_TICKERS)
+                          and all(r[f"{ratio}{p}"] < 1 for r in idx for p in parts)
+                          and all(b >= a for a, b in (res[f"{k} 통과 기본 → C1L2"] for k in ("VaR 검정", "ES 검정"))))
+    return res
+
+
+def _iv_lag_lines(rows):
+    lr = var_iv_lag_rule(rows)
+    if lr is None:
+        return []
+    lines = ["", "## 하루 VaR VKOSPI 하루 늦게 섞기(C1L2) — 사전 등록 규칙", "",
+             "KRX는 그날 VKOSPI를 다음 영업일 아침에 주므로 실전 기록·앱은 C1이 쓰는 전날 값을 받지 못합니다. "
+             "C1L2는 하루 더 지난(마지막 종가일의 전 거래일) VKOSPI를 반반 섞습니다. 기준은 GARCH만(기본). "
+             "규칙은 [EXPERIMENTS.md](../EXPERIMENTS.md) (2026-10-30 사전 등록).", ""]
+    for t in VKOSPI_TICKERS:
+        if f"{t} 비율" in lr:
+            ex = lambda k: " · ".join(_pct(v, False) for v in lr[f"{t} {k} 기본 · C1 · C1L2"])
+            lines.append(f"- {INDEX_NAMES.get(t, t)}: 분위수 손실 비율(C1L2 ÷ 기본) 전체 {lr[f'{t} 비율']:.3f} · "
+                         f"앞 {lr[f'{t} 비율 앞 절반']:.3f} · 뒤 {lr[f'{t} 비율 뒤 절반']:.3f}, C1L2 ÷ C1 {lr[f'{t} C1L2 ÷ C1']:.3f}, "
+                         f"95% 예외 기본·C1·C1L2 {ex('VaR 95% 예외')}, 99% {ex('VaR 99% 예외')}")
+    pc = lambda k: "{} → {}".format(*lr[f"{k} 통과 기본 → C1L2"])
+    lines.append(f"- VaR 통과 {pc('VaR 검정')}, ES 통과 {pc('ES 검정')} → **{'C1L2 채택' if lr['C1L2 채택'] else 'C1L2 미채택'}**")
+    return lines
 
 
 VAR_GROUP_CANDS = {"k2": "K2", "m1": "M1", "r1": "R1"}     # 지금 기본에 곱하는 후보 (같은 규칙으로 따로 판정)
@@ -560,6 +610,7 @@ def report_markdown(rows, rank=None, when="", version="", buckets=None):
             lines.append(f"| {r['이름']} | {three(r, 'VaR 95% 예외', lambda v: _pct(v, False))} | "
                          f"{three(r, 'VaR 99% 예외', lambda v: _pct(v, False))} | {three(r, 'VaR 검정', str)} | {three(r, 'ES 검정', str)} | "
                          f"{ratios(r, 'recal')} | {ratios(r, 'vkospi') if '[vkospi] VaR 검정' in r else '—'} |")
+    lines += _iv_lag_lines(rows)
     for m in VAR_GROUP_CANDS:
         lines += _group_rule_lines(rows, m)
     rec = [r for r in ok if "[최근1년 제외] 방향 z" in r]
@@ -675,6 +726,7 @@ if __name__ == "__main__":
     print(f"총 {time.time() - t_all:.0f}초, 실패 {sum('오류' in r for r in rows)}종목", flush=True)
     print("VaR 꼬리 분포 사전 등록 규칙:", var_tail_rule(rows), flush=True)
     print("VaR σ 보정 사전 등록 규칙:", var_scale_rule(rows), flush=True)
+    print("VKOSPI 하루 늦게 섞기(C1L2) 사전 등록 규칙:", var_iv_lag_rule(rows), flush=True)
     for m, n in VAR_GROUP_CANDS.items():
         print(f"VaR 재보정 후보 {n} 사전 등록 규칙:", var_cluster_rule(rows, m), flush=True)
     sys.exit(1 if all("오류" in r for r in rows) else 0)
