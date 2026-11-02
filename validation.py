@@ -1,4 +1,4 @@
-"""실제 데이터 검증 보고서: 계산이 맞는지(tests.py)와 별개로, 비용을 뺀 뒤에도 돈이 되는지를 실제 데이터로 잰다.
+"""실제 데이터 검증 보고서: 계산이 맞는지(tests/)와 별개로, 비용을 뺀 뒤에도 돈이 되는지를 실제 데이터로 잰다.
 
 GitHub Actions(validation.yml)가 매주 돌려 validation/summary.csv와 validation/README.md로 커밋한다.
 기록 종목(forecast_log/tickers.txt)마다 앱 기본 설정 그대로, 워크포워드(그 시점까지의 데이터로만 학습·선택)로:
