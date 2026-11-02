@@ -1,5 +1,7 @@
 # Quant Finance Project KOR
 
+*English summary: [README.en.md](README.en.md)*
+
 한국 주식(코스피·코스닥) 전용 예측·검증 프로그램입니다. 미국·글로벌 버전은 [Quant_Finance_Project](https://github.com/Hyeonwoo01/Quant_Finance_Project)입니다.
 모든 예측은 **그 시점까지의 데이터로만 학습하는 워크포워드 방식**으로 검증하고, 검증 결과를 화면에 함께 보여줍니다.
 분석·검증용 도구이며 주문을 내는 실거래 시스템이 아닙니다 ([범위와 한계](#범위와-한계)).
