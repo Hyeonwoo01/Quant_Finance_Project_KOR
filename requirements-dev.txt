@@ -1,0 +1,2 @@
+# 테스트 실행용 (앱 실행에는 필요 없음): pip install -r requirements-dev.txt 후 pytest
+pytest==9.2.0

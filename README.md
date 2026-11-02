@@ -1,5 +1,7 @@
 # Quant Finance Project KOR
 
+*English summary: [README.en.md](README.en.md)*
+
 한국 주식(코스피·코스닥) 전용 예측·검증 프로그램입니다. 미국·글로벌 버전은 [Quant_Finance_Project](https://github.com/Hyeonwoo01/Quant_Finance_Project)입니다.
 모든 예측은 **그 시점까지의 데이터로만 학습하는 워크포워드 방식**으로 검증하고, 검증 결과를 화면에 함께 보여줍니다.
 분석·검증용 도구이며 주문을 내는 실거래 시스템이 아닙니다 ([범위와 한계](#범위와-한계)).
@@ -116,7 +118,7 @@ GitHub 예약 실행은 몇 시간 늦게 돌 때가 있습니다(2026-10-23은 
 
 ### 테스트
 
-`python tests.py` (3~4분). 푸시·PR마다 GitHub Actions가 Python 3.12·3.13에서 자동으로 돌립니다.
+`pip install -r requirements-dev.txt` 후 `pytest` (3~4분, 주제별 12개 파일·86개 테스트). 푸시·PR마다 GitHub Actions가 Python 3.12·3.13에서 자동으로 돌립니다.
 
 ## 검증: 계산이 맞는지 vs 돈이 되는지
 
@@ -124,7 +126,7 @@ GitHub 예약 실행은 몇 시간 늦게 돌 때가 있습니다(2026-10-23은 
 
 | 질문 | 어떻게 확인하나 | 어디서 보나 |
 |---|---|---|
-| **계산이 맞나** (미래 정보·시간축·비용) | `tests.py`가 푸시마다 Python 3.12·3.13에서 자동 실행. 미래 데이터를 바꿔도 과거 예측·요인 값이 그대로인지, 판단(t) → 체결(t+1 종가) → 수익(t+2부터)의 순서, 비용은 체결 뒤 첫 수익과 같은 날·세금은 판 날에만 체결일 세율로, 겹침 보정 t값·블록 부트스트랩 구간이 우연을 목표만큼만 '유의'로 잡는지(몬테카를로: 독립 자료와 GARCH·두꺼운 꼬리 수익률, 조건·결과는 [MODELS.md](MODELS.md#겹침-보정-t값-hansen-hodrick)) 등 | [Actions → tests](https://github.com/Hyeonwoo01/Quant_Finance_Project_KOR/actions/workflows/tests.yml) |
+| **계산이 맞나** (미래 정보·시간축·비용) | 테스트(`tests/`, pytest)가 푸시마다 Python 3.12·3.13에서 자동 실행. 미래 데이터를 바꿔도 과거 예측·요인 값이 그대로인지, 판단(t) → 체결(t+1 종가) → 수익(t+2부터)의 순서, 비용은 체결 뒤 첫 수익과 같은 날·세금은 판 날에만 체결일 세율로, 겹침 보정 t값·블록 부트스트랩 구간이 우연을 목표만큼만 '유의'로 잡는지(몬테카를로: 독립 자료와 GARCH·두꺼운 꼬리 수익률, 조건·결과는 [MODELS.md](MODELS.md#겹침-보정-t값-hansen-hodrick)) 등 | [Actions → tests](https://github.com/Hyeonwoo01/Quant_Finance_Project_KOR/actions/workflows/tests.yml) |
 | **돈이 되나** (실제 데이터, 비용·세금 후) | `validation.py`가 매주 기록 종목마다 앱 기본 설정 그대로 워크포워드 검증: 방향 예측력(21일 예측을 21일 결과로), 방향·국면 전략 vs 단순 보유(연 수익률·샤프·최대 낙폭, 초과수익의 블록 부트스트랩 95% 신뢰구간, 가정 바꿔 통과 수, DSR), 21일 분할 보유 전략, 확률 구간별 실제 수익, 하루 VaR·ES 검정, 코스피 종목 고르기(손익분기 비용·위험 반영 비중·시장 구간별·기준 전략·리밸런싱 날짜 바꿔 보기) | [validation/README.md](validation/README.md) |
 | **앞으로도 맞나** (손대지 않은 표본) | 매일·매주 예측을 미리 적어 두고 나중에 채점 (모델 선택·튜닝에 쓰지 않는 기록) | 예측 정확도 검증 탭, 코스피 종목 고르기 탭의 실전 기록 |
 
@@ -173,7 +175,7 @@ GitHub 예약 실행은 몇 시간 늦게 돌 때가 있습니다(2026-10-23은 
 |---|---|
 | 체결 시점 | t일 종가까지 보고 판단 → **다음 거래일 종가에 체결** (기본). 사이드바에서 '신호 낸 날 종가(낙관적)'로 바꿔 비교 가능 |
 | 비용 | 사고팔 때 각각 수수료·체결 비용(bp) + 팔 때 증권거래세(실제로 파는 날의 세율). 비용은 체결 뒤 첫 수익과 같은 날에 뺌 |
-| 미래 정보 차단 | 모든 모델은 판단 시점까지의 데이터로만 학습·선택. `tests.py`가 미래 데이터를 바꿔도 과거 예측이 그대로인지 확인 |
+| 미래 정보 차단 | 모든 모델은 판단 시점까지의 데이터로만 학습·선택. 테스트(`tests/`)가 미래 데이터를 바꿔도 과거 예측이 그대로인지 확인 |
 | 겹치는 예측 기간 | h일 예측을 매일 하면 정답이 겹침 → z는 Hansen-Hodrick 표준오차(시차 h−1) |
 | 과적합 보정 | 여러 설정 중 1등의 착시를 Deflated Sharpe로 보정 (수익률 자기상관만큼 표본을 줄여 셈). 코드 밖에서 사람이 바꿔 본 것은 보정되지 않아, 기본 설정을 고정하고 실전 기록으로 판단 ([EXPERIMENTS.md](EXPERIMENTS.md)) |
 | VaR 검증 | 하루 VaR(95%·99%)를 Kupiec·Christoffersen 검정 |
@@ -215,7 +217,8 @@ KRX Open API 이용 승인 완료 (2026-10-26 점검: 파생상품지수·옵션
 
 | 파일 | 역할 |
 |---|---|
-| `app.py` | Streamlit 앱 (한국 종목 전용) |
+| `app.py` | Streamlit 앱 뼈대: 사이드바 설정, 종목 시세·GARCH·방향 모델 같은 공통 계산, 요약 카드, 탭 배치 |
+| `app_data.py`, `views/` | 앱의 데이터 불러오기·계산(캐시)과 탭별 화면 (`views/price_range.py` 주가 예측 범위 … `views/accuracy.py` 예측 정확도 검증, 공통 표 서식은 `views/common.py`) |
 | `kr_costs.py` | 증권거래세(연도별)·수수료 비용 모델 |
 | `MODELS.md` | 모델 설명: 수식, 쉬운 풀이, 코드 위치, 검증 방법 |
 | `EXPERIMENTS.md` | 실험 기록: 고정한 기본 설정, 결과를 본 뒤 바꾼 것과 이유, 손대지 않은 검증 구간 |
@@ -227,7 +230,7 @@ KRX Open API 이용 승인 완료 (2026-10-26 점검: 파생상품지수·옵션
 | `forecast_log.py`, `forecast_log/` | 실전 기록: 예측 기록(`record`)·채점·데이터 연결 점검(`check`), 종목 목록 `tickers.txt`, 기록 `log.csv` |
 | `repro.py` | 재현 정보: 데이터 지문, 코드 버전 |
 | `ui.py`, `.streamlit/config.toml` | 디자인 시스템 |
-| `tests.py` | 계산·미래 정보 누출·체결 시점·비용 모델·기록 채점 테스트 (`python tests.py`) |
+| `tests/` | 계산·미래 정보 누출·체결 시점·비용 모델·기록 채점 테스트 (pytest, 주제별 `test_*.py`, 함께 쓰는 합성 데이터는 `conftest.py`) |
 | `validation.py`, `validation/` | 실제 데이터 검증 보고서: 비용·세금 후 전략 vs 단순 보유, 신뢰구간, VaR 검정 (`python validation.py`) |
 | `.github/workflows/` | `tests.yml` 푸시·PR마다 테스트, `forecast-log.yml` 평일 실전 기록, `ranking.yml` 매주 종목 고르기 계산·추천 기록, `validation.yml` 매주 실제 데이터 검증 보고서 |
 
