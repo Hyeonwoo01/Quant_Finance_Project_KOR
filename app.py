@@ -582,11 +582,11 @@ with tab_dir:
             bw, br, bp = RB["by_window"], RB["by_rule"], RB["by_period"]
             n_pass, n_all = int(bw["검증 통과"].sum() + bp["검증 통과"].sum()), len(bw) + len(bp)
             n_beat = int((br.values > 0).sum())
-            label, kind = (("모든 경우 통과", "approve") if n_pass == n_all else
+            label, badge = (("모든 경우 통과", "approve") if n_pass == n_all else
                            ("절반 이상 통과", "elective") if n_pass * 2 >= n_all else
                            ("일부에서만 통과", "elective") if n_pass else ("한 번도 통과 못 함", "reject"))
             ui.verdict(f"{dir_h}거래일 방향 예측 · 선택 기간 {len(bw)}가지 + 시기 {len(bp)}구간", f"{n_pass} / {n_all}",
-                       "경우에서 검증 통과", [(label, kind)],
+                       "경우에서 검증 통과", [(label, badge)],
                        f"검증 통과 = 확률 정확도가 기본 확률보다 좋고, 적중률 우위가 우연이 아닌 경우(z > 2). "
                        f"보유 기준 × 거래비용 {br.size}가지 중 전략 샤프가 단순 보유보다 높았던 경우는 {n_beat}가지였습니다.")
 
