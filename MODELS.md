@@ -105,7 +105,7 @@ GJR에서 $`\gamma`$가 절반만 들어가는 건 하락한 날이 대략 절�
   500일이면 99% VaR의 예외는 5번 정도뿐이라 검정력이 약합니다. 실제 데이터 검증 보고서는 첫 3년 뒤 전체 기간(10년 자료면 약 1,700일)으로 검정하고, 앞·뒤 절반으로 나눠 시기별로도 봅니다.
 - **대칭 vs GJR**: 같은 시점들에서 두 모델의 예측 오차 비교.
 
-코드: `GarchVolForecaster`, `fit_vol_model`, `var_es`, `var_backtest` (`quant_engine.py`), `run_backtest` (`app.py`).
+코드: `GarchVolForecaster`, `fit_vol_model`, `var_es`, `var_backtest` (`quant_engine.py`), `run_backtest` (`app_data.py`).
 
 ---
 

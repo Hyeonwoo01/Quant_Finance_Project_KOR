@@ -215,7 +215,8 @@ KRX Open API 이용 승인 완료 (2026-10-26 점검: 파생상품지수·옵션
 
 | 파일 | 역할 |
 |---|---|
-| `app.py` | Streamlit 앱 (한국 종목 전용) |
+| `app.py` | Streamlit 앱 뼈대: 사이드바 설정, 종목 시세·GARCH·방향 모델 같은 공통 계산, 요약 카드, 탭 배치 |
+| `app_data.py`, `views/` | 앱의 데이터 불러오기·계산(캐시)과 탭별 화면 (`views/price_range.py` 주가 예측 범위 … `views/accuracy.py` 예측 정확도 검증, 공통 표 서식은 `views/common.py`) |
 | `kr_costs.py` | 증권거래세(연도별)·수수료 비용 모델 |
 | `MODELS.md` | 모델 설명: 수식, 쉬운 풀이, 코드 위치, 검증 방법 |
 | `EXPERIMENTS.md` | 실험 기록: 고정한 기본 설정, 결과를 본 뒤 바꾼 것과 이유, 손대지 않은 검증 구간 |
