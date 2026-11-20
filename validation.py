@@ -250,6 +250,9 @@ def validate(ticker):
     row.update({"VaR 검증 일수": int(v95["관측일"]),
                 "VaR 95% 예외 비율": v95["예외 비율"], "VaR 95% p값": v95["종합 p값"],
                 "VaR 99% 예외 비율": v99["예외 비율"], "VaR 99% p값": v99["종합 p값"],
+                # 종합 p값을 나눠 본다: Kupiec = 예외 횟수가 목표와 맞는가, Christoffersen = 예외가 몰려 나오지 않는가
+                "VaR 95% Kupiec p값": v95["Kupiec p값"], "VaR 95% Christoffersen p값": v95["Christoffersen p값"],
+                "VaR 99% Kupiec p값": v99["Kupiec p값"], "VaR 99% Christoffersen p값": v99["Christoffersen p값"],
                 "VaR 95% 예외 (앞 절반)": float(vd["예외 95%"].iloc[:half].mean()),
                 "VaR 95% 예외 (뒤 절반)": float(vd["예외 95%"].iloc[half:].mean()),
                 "ES 95% 손실 비율": v95["예외일 손실 ÷ 예측 ES"], "ES 95% p값": v95["ES 검정 p값"],
@@ -499,7 +502,7 @@ def report_markdown(rows, rank=None, when="", version="", buckets=None):
         "|---|---|",
         "| 방향 예측력 | 확률 정확도 개선 > 0 그리고 겹침 보정 z > 2 (21거래일 예측을 21거래일 결과로 채점) |",
         f"| 전략의 경제적 가치 | 비용·세금 뺀 일간 초과수익(전략 − 단순 보유)의 블록 부트스트랩(블록 {BLOCK}거래일) 95% 신뢰구간 하한 > 0 |",
-        "| VaR 검정 | 하루 VaR 95%·99% 모두 Kupiec·Christoffersen 종합 p값 > 0.05 |",
+        "| VaR 검정 | 하루 VaR 95%·99% 모두 Kupiec·Christoffersen 종합 p값 > 0.05 (두 검정의 p값도 따로 보고: Kupiec = 예외 횟수, Christoffersen = 예외 몰림) |",
         "| ES 검정 | 예외일의 (실제 손실 − 예측 ES) ÷ 변동성 평균이 0보다 크지 않음 (McNeil·Frey 단측 p값 > 0.05, 95%·99% 모두) |",
         "| 코스피 종목 고르기 | 비용 후 초과수익 t > 2 그리고 IC t > 2 |",
         "",
@@ -559,11 +562,15 @@ def report_markdown(rows, rank=None, when="", version="", buckets=None):
               "앞·뒤 절반 = 검증 기간을 반으로 나눈 95% 예외 비율 (시기에 따라 흔들리는지). "
               "앱·기록과 같이 코스피 지수·KODEX 200은 GARCH와 전전 거래일 VKOSPI(실전에서 받을 수 있는 값)를 반반 섞은 σ(이름 옆 *), 나머지 종목은 GARCH와 "
               "장중 고가·저가로 잰 최근 실현 분산을 반반 섞은 σ(이름 옆 †)로 계산합니다 (2026-10-29·30 판정).", "",
-              "| 종목 | 검증 일수 | 95% 예외 (목표 5%) | p값 | 99% 예외 (목표 1%) | p값 | VaR 결과 | ES 손실 비율 95% · 99% | ES p값 95% · 99% | ES 결과 | 95% 예외 앞·뒤 절반 |",
-              "|---|---|---|---|---|---|---|---|---|---|---|"]
+              "p값: 종합 = Kupiec·Christoffersen 합 (VaR 결과의 기준), Kupiec = 예외 횟수가 목표와 맞는가, "
+              "Christoffersen = 전날 예외 여부와 독립인가 (예외가 몰려 나오지 않는가).", "",
+              "| 종목 | 검증 일수 | 95% 예외 (목표 5%) | 종합 p | 99% 예외 (목표 1%) | 종합 p | Kupiec p 95% · 99% | Christoffersen p 95% · 99% | VaR 결과 | ES 손실 비율 95% · 99% | ES p값 95% · 99% | ES 결과 | 95% 예외 앞·뒤 절반 |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in ok:
         lines.append(f"| {r['이름']}{ {'VKOSPI 섞기': ' *', '장중 고가·저가 섞기': ' †'}.get(r.get('VaR σ 보정'), '') } | {r['VaR 검증 일수']:,} | {_pct(r['VaR 95% 예외 비율'], False)} | {_num(r['VaR 95% p값'], '{:.2f}')} | "
-                     f"{_pct(r['VaR 99% 예외 비율'], False)} | {_num(r['VaR 99% p값'], '{:.2f}')} | {r['VaR 검정']} | "
+                     f"{_pct(r['VaR 99% 예외 비율'], False)} | {_num(r['VaR 99% p값'], '{:.2f}')} | "
+                     f"{_num(r.get('VaR 95% Kupiec p값'), '{:.2f}')} · {_num(r.get('VaR 99% Kupiec p값'), '{:.2f}')} | "
+                     f"{_num(r.get('VaR 95% Christoffersen p값'), '{:.2f}')} · {_num(r.get('VaR 99% Christoffersen p값'), '{:.2f}')} | {r['VaR 검정']} | "
                      f"{_num(r['ES 95% 손실 비율'], '{:.2f}')} · {_num(r['ES 99% 손실 비율'], '{:.2f}')} | "
                      f"{_num(r['ES 95% p값'], '{:.2f}')} · {_num(r['ES 99% p값'], '{:.2f}')} | {r['ES 검정']} | "
                      f"{_pct(r['VaR 95% 예외 (앞 절반)'], False)} · {_pct(r['VaR 95% 예외 (뒤 절반)'], False)} |")
@@ -683,8 +690,9 @@ def run(tickers, out_dir=OUT_DIR, say=print):
                 f"초과 {r['분할 초과수익(연)']:+.1%} [{r['분할 초과 95% 하한']:+.1%}, {r['분할 초과 95% 상한']:+.1%}] → {r['분할 보유 경제적 가치']}\n"
                 f"  국면 전략: 연 {r['국면 전략 연 수익률']:+.1%} 샤프 {r['국면 전략 샤프']:.2f} 낙폭 {r['국면 전략 최대 낙폭']:.0%} | "
                 f"초과 {r['국면 초과수익(연)']:+.1%} [{r['국면 초과 95% 하한']:+.1%}, {r['국면 초과 95% 상한']:+.1%}] → {r['국면 전략 경제적 가치']}\n"
-                f"  하루 VaR: 95% 예외 {r['VaR 95% 예외 비율']:.1%} (p {r['VaR 95% p값']:.2f}), "
-                f"99% 예외 {r['VaR 99% 예외 비율']:.1%} (p {r['VaR 99% p값']:.2f}) → {r['VaR 검정']} ({r['VaR 검증 일수']:,}일)\n"
+                f"  하루 VaR: 95% 예외 {r['VaR 95% 예외 비율']:.1%} (종합 p {r['VaR 95% p값']:.2f}, Kupiec {r['VaR 95% Kupiec p값']:.2f}, "
+                f"Christoffersen {r['VaR 95% Christoffersen p값']:.2f}), 99% 예외 {r['VaR 99% 예외 비율']:.1%} (종합 p {r['VaR 99% p값']:.2f}, "
+                f"Kupiec {r['VaR 99% Kupiec p값']:.2f}, Christoffersen {r['VaR 99% Christoffersen p값']:.2f}) → {r['VaR 검정']} ({r['VaR 검증 일수']:,}일)\n"
                 f"  ES: 손실 비율 95% {r['ES 95% 손실 비율']:.2f}·99% {r['ES 99% 손실 비율']:.2f} "
                 f"(p {r['ES 95% p값']:.2f}·{r['ES 99% p값']:.2f}) → {r['ES 검정']} | GARCH 재적합 실패 {r['GARCH 재적합 실패']} | {r['GARCH 진단']}\n"
                 f"  꼬리 분포 비교: 95% 예외 t {r['[t] VaR 95% 예외']:.1%}·FHS {r['[fhs] VaR 95% 예외']:.1%}, "

@@ -60,6 +60,12 @@ def test_validation_report():
         # VKOSPI 섞기 대상 종목은 본 표가 실전에서 받을 수 있는 전전 거래일 VKOSPI를 섞은 VaR (C1L2, 2026-10-30 판정)
         assert _vr["VaR σ 보정"] == "VKOSPI 섞기" and _vr["VaR 검정"] == _vr["[vkospi2] VaR 검정"]
         assert _vr["VaR 95% 예외 비율"] == _vr["[vkospi2] VaR 95% 예외"] and _vr["VaR 99% 예외 비율"] == _vr["[vkospi2] VaR 99% 예외"]
+        # 종합 p값을 Kupiec(예외 횟수)·Christoffersen(예외 몰림)로 나눠 보고: 두 통계량의 합이 종합(자유도 2)
+        from scipy.stats import chi2
+        for _lv in ("95%", "99%"):
+            _kp, _cp = _vr[f"VaR {_lv} Kupiec p값"], _vr[f"VaR {_lv} Christoffersen p값"]
+            assert 0 <= _kp <= 1 and 0 <= _cp <= 1
+            assert np.isclose(chi2.sf(chi2.isf(_kp, 1) + chi2.isf(_cp, 1), 2), _vr[f"VaR {_lv} p값"], rtol=1e-6, atol=1e-9)
         # 예외 몰림 후보 K2는 지금 기본(이 종목은 VKOSPI 섞기)과 비교
         assert _vr["[cur] VaR 검정"] == _vr["VaR 검정"] and _vr["[k2] VaR 검정"] in ("통과", "기각")
         assert all(np.isfinite(_vr[f"분위수 손실 비율 (k2 ÷ 현재){_p}"]) for _p in ("", " 앞 절반", " 뒤 절반"))
@@ -162,6 +168,7 @@ def test_validation_report():
             assert "## 하루 VaR σ 보정" in _md and ("**C2 채택**" in _md or "**C2 미채택**" in _md)
             assert "## 하루 VaR 예외 몰림" in _md and ("나머지 1종목" in _md) and "## 하루 VaR 휴장 뒤 첫 거래일" in _md
             assert "## 하루 VaR 장중 고가·저가 변동성 섞기(R1)" in _md
+            assert "| Kupiec p 95% · 99% | Christoffersen p 95% · 99% |" in _md
             assert "## 최근 1년(이례적 급등락 구간)을 뺀 결과" in _md
             # 코스피 200 종목이 아니면 본 표 = 장중 고가·저가 섞기(R1), R1 비교 기준은 기본(t), K2·M1 비교 기준은 R1
             assert _rows[0]["VaR σ 보정"] == "장중 고가·저가 섞기" and _rows[0]["VaR 검정"] == _rows[0]["[r1] VaR 검정"]
